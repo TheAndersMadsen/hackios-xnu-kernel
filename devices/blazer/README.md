@@ -44,13 +44,17 @@ answer, the Mesa/GLI renderer path, the userland image build, and the
 | --- | --- |
 | XNU entry on the phone (kexec ladder) | ✅ Proven ×4 on real hardware (entry marker `0x5A5A5A5A`) |
 | Direct tegu-style shim → XNU | ✅ Reaches the kernel; watchdog + fault-screen console |
-| launchd + root mount in QEMU | ✅ APFS and HFS roots, full daemon set |
+| **Stock iOS lock screen renders (blazer kernel, QEMU)** | ✅ Composited, updating lock screen; zero panics; SpringBoard up in 26.75 s |
+| launchd + root mount in QEMU | ✅ APFS and HFS roots, full daemon set (173 daemons spawned) |
 | backboardd → scanout in QEMU | ✅ Display pipeline works end-to-end |
 | Software renderer in backboardd | ✅ Mesa softpipe ES3 context created; Apple-logo frame composites |
-| Pixel 10 Pro port on the new foundation | 🚧 This branch — platform, DPU, UFS, image |
-| On-device root + dyld cache transport | 🚧 userdata-file → F2FS ro-mount → `md0` |
-| SpringBoard UI on the phone | ⬜ Not yet (content gap in userland, not the display pipeline) |
-| Touch, Wi-Fi, cellular, camera, charging, BT | ⬜ Unstarted on this SoC |
+| Identity records (dslocal) | ✅ Real records generated from the target root and staged root-owned — 150/150 at `0:0`, 940-check gate (`tools/dslocal/`) |
+| Delivery images (boot v4 + AVB, `fastboot boot`) | ✅ Host-built and host-validated (kexec control + direct-embedded fallback) |
+| Pixel 10 Pro port on the new foundation | 🚧 Platform, display handoff, UFS takeover and panicdump in source — all hardware paths default-off |
+| On-device root + dyld cache transport | 🚧 userdata-file → F2FS ro-mount → `md0`; cold UFS/PHY/CPM init stays in the Linux first stage |
+| First device render (DPU scanout on hardware) | ⬜ Needs the display-owning Linux first stage emitting the validated handoff (`docs/RENDER.md` §5) |
+| Unlock / home-screen swipe, GL flag chain | ⬜ Lock screen is the proven depth; unlock not driven yet; softpipe flags designed, not yet run on the platform image |
+| Touch (TCM), Wi-Fi, cellular, camera, charging, BT | ⬜ Unstarted on this SoC |
 | Secure Enclave / activation / Apple account | ⛔ Out of scope by design |
 
 <details>
@@ -62,6 +66,18 @@ answer, the Mesa/GLI renderer path, the userland image build, and the
 backboardd, captured in QEMU. Included as proof the render path works — it is a
 QEMU capture, not a claim of an on-device lock screen.</em></p>
 </div>
+
+The render milestone behind the status table: the blazer-branch kernel (built
+from this branch's source model) boots the verified userland image on the
+upstream QEMU harness to the **stock iOS lock screen over the color
+wallpaper** — full UI content from ~255 s, then stable frames with the
+lock-screen clock's minute ticks; 36 frame captures; zero `panic(` lines;
+pixel-match 2.9–3.1/255 against an independent control boot (residual = the
+clock digits). One honest boundary: the QEMU loader's synthesized ADT carries
+the iPhone identity, so `BlazerPlatformExpert` (matched by
+`google,lga-blazer`) cannot engage there — the milestone proves the kernel's
+userland/display stack end-to-end, while the SoC-specific drivers engage on
+the first-stage ADT contract (`docs/BOOT-CONTRACT.md` §2).
 </details>
 
 ---
@@ -101,6 +117,8 @@ Two delivery paths are being ported, and **neither requires flashing**:
    in one hop, with early watchdog quiesce and a framebuffer findings console.
 
 Read [`docs/SAFETY.md`](docs/SAFETY.md) before running anything on a real phone.
+Both paths are already built and host-validated as boot-v4 + AVB images (see
+[`docs/BUILD.md`](docs/BUILD.md)); the only unproven step is the phone itself.
 
 ### Magisk / `init_boot` ramdisk race (rooted phones)
 
@@ -117,11 +135,13 @@ appended last so `rdinit=/xni` wins. Do not “fix” this by touching `init_boo
 
 | Task | What it needs |
 | --- | --- |
-| **DPU / display** | CPM mailbox → DPU power → a live scanout address. Hard lesson: DC9x00 readback on real silicon is an **async SError → DER Event 20 crash reset** (`0xc00e`), even though it is harmless in QEMU. Keep it off by default; `files/laguna_mbox.c` is the mailbox skeleton. |
+| **Cold UFS/DPU production (the big one)** | A display-owning **Linux first stage** that brings up Google's UFS/PHY/CPM cold, programs a dedicated linear scanout, preserves it across kexec and emits the validated 128-byte handoff. That single piece unlocks the first on-device render. The exact CPM frames, gates and record contract are in [`docs/RENDER.md`](docs/RENDER.md) §2–§6. Hard lesson: DC9x00 readback on real silicon is an **async SError → DER Event 20 crash reset** (`0xc00e`), even though it is harmless in QEMU — keep every probe/readback off. |
 | **Touch (TCM)** | The host-tested driver exists (198/198). Needs on-device AOC pad-slot layout, TBN bus-parked check, CPM hard reset/rails, TCM generation detect, SSI clock liveness. |
-| **UFS / root transport** | A normal userdata file (adb push) that the ladder's Linux stage ro-mounts (F2FS) and kexec-segments as `md0`. Cache files must be **uid 0**; `/usr/lib/system/libdispatch.dylib` must **not** exist on disk. |
-| **SpringBoard content** | The display pipeline works; the gap is userland: LaunchServices/`lsd` bootstrap, first-unlock, scene-building. See [`docs/PORTING.md`](docs/PORTING.md). |
-| **Cellular, Wi-Fi, camera, charging, BT** | Unstarted on this SoC. |
+| **UFS / root transport** | A normal userdata file (adb push) that the ladder's Linux stage ro-mounts (F2FS) and kexec-segments as `md0`. Cache files must be **uid 0**; there must be no `/usr/lib/system/libdispatch.dylib` on disk (the built image already satisfies both — see `docs/BUILD.md`). |
+| **GL flag chain** | A `GL=1 REST=1` userland build exercised with the softpipe boot-args on the platform image (`docs/RENDER.md` §8–§9). Never `gpu=1` — that is the Qualcomm Adreno driver. |
+| **`var_store` backend** | A safe Tensor storage/write path with partition-independent bounds and read-back verification, before `var_store=1 ufs_write=1` are ever set. |
+| **SpringBoard depth** | The lock screen renders in QEMU; the next walls are first-unlock and scene-building, not the display pipeline. See [`docs/PORTING.md`](docs/PORTING.md). |
+| **Cellular, Wi-Fi, camera, charging, BT** | Unstarted on this SoC — and unlike the Qualcomm ports, there is no MPSS/IPA/Hexagon stack to port; cellular would be a new project of its own. |
 
 ---
 
@@ -132,10 +152,11 @@ appended last so `rdinit=/xni` wins. Do not “fix” this by touching `init_boo
 | [`assets/`](assets/) | banner, boot-chain diagram, QEMU evidence |
 | [`fdt/`](fdt/) | the phone's device tree |
 | [`files/`](files/) | laguna driver sources (mailbox first) |
-| [`tools/`](tools/) | device-tree and log tools |
+| [`tools/`](tools/) | device-tree and log tools, plus [`tools/dslocal/`](tools/dslocal/README.md) — the identity-record staging kit any port can reuse |
 | [`docs/PORTING.md`](docs/PORTING.md) | the full porting checklist and current wall map |
 | [`docs/BUILD.md`](docs/BUILD.md) | clean kernel build, marker and host-validation recipe |
 | [`docs/BOOT-CONTRACT.md`](docs/BOOT-CONTRACT.md) | kexec/direct entry, ADT, boot-args and RAMDisk→md0 |
+| [`docs/RENDER.md`](docs/RENDER.md) | display/render bring-up: CPM → DPU → scanout handoff, softpipe + EAGL/GLI, boot-arg profiles |
 | [`soc.args`](soc.args) | FDT-generated Tensor handoff addresses (no Qualcomm `soc_*`) |
 | [`docs/SAFETY.md`](docs/SAFETY.md) | the on-device safety rails — read first |
 
@@ -148,8 +169,9 @@ the project; see the top-level `LEGAL.md`.
 ## Contributing and contact
 
 **Forks and pull requests are very welcome.** This is an active bring-up, and
-help is especially wanted on the DC9x00 display, TCM touch, UFS/root transport
-and the remaining SpringBoard/userland walls.
+help is especially wanted on the display-owning Linux first stage (cold UFS +
+DPU scanout production — the piece that unlocks the first on-device render),
+TCM touch, the GL flag chain and the remaining unlock/scene-building walls.
 
 Questions, dumps from your own Pixel 10 Pro, or offers to help: **Discord
 `@andersmadsen`**. If you have a laguna/Tensor device and a boot log, that is
