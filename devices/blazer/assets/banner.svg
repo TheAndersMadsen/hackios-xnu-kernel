@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" role="img" aria-label="HakiOS blazer — iOS on Pixel 10 Pro">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a0f1c"/>
+      <stop offset="0.55" stop-color="#0d1b2e"/>
+      <stop offset="1" stop-color="#12283f"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5ee7df"/>
+      <stop offset="0.5" stop-color="#6aa8ff"/>
+      <stop offset="1" stop-color="#b78cff"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#12314f"/>
+      <stop offset="1" stop-color="#0a1a2c"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="10" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="340" rx="22" fill="url(#bg)"/>
+  <rect x="1.5" y="1.5" width="1197" height="337" rx="20.5" fill="none" stroke="#2b4a6b" stroke-opacity="0.55"/>
+
+  <!-- stylized phone -->
+  <g transform="translate(74,44)">
+    <rect x="0" y="0" width="132" height="252" rx="24" fill="#0a1626" stroke="#4d7fb3" stroke-width="2"/>
+    <rect x="9" y="14" width="114" height="224" rx="14" fill="url(#screen)" stroke="#1d3a57"/>
+    <rect x="46" y="5" width="40" height="4" rx="2" fill="#3a5a7a"/>
+    <circle cx="66" cy="122" r="34" fill="none" stroke="url(#accent)" stroke-width="2.5" filter="url(#glow)" opacity="0.9"/>
+    <text x="66" y="130" text-anchor="middle" font-family="SF Mono, Menlo, monospace" font-size="20" font-weight="700" fill="#8fd6ff">XNU</text>
+    <text x="66" y="158" text-anchor="middle" font-family="SF Mono, Menlo, monospace" font-size="11" fill="#5ee7df">0x5A5A5A5A</text>
+    <rect x="30" y="188" width="72" height="7" rx="3.5" fill="#1f4a6b"/>
+    <rect x="30" y="188" width="46" height="7" rx="3.5" fill="url(#accent)" opacity="0.85"/>
+    <circle cx="66" cy="224" r="4" fill="#5ee7df" opacity="0.85"/>
+  </g>
+
+  <!-- wordmark -->
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+    <text x="252" y="96" font-size="21" letter-spacing="4" fill="#6aa8ff" font-weight="600">HAKIOS · DEVICES</text>
+    <text x="248" y="158" font-size="62" font-weight="800" fill="#f2f7ff">Pixel 10 Pro</text>
+    <text x="252" y="200" font-size="27" font-weight="600" fill="url(#accent)">iOS on Tensor G5 “laguna” · codename blazer</text>
+    <text x="252" y="248" font-size="19" fill="#9db4cc">Apple's XNU + stock iOS userland, on our own drivers.</text>
+    <text x="252" y="278" font-size="19" fill="#9db4cc">Delivered by <tspan font-weight="700" fill="#5ee7df">fastboot boot</tspan> into RAM — nothing flashed.</text>
+    <text x="252" y="308" font-size="16" fill="#5f7a94">Research bench · xnu-8796 · not a ROM</text>
+  </g>
+</svg>
