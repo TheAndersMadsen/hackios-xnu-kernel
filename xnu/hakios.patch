@@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..be702e28890d 100644
+index 44274016a4cf..1e8e59f3fe2b 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,41 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,43 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -76,6 +76,8 @@ index 44274016a4cf..be702e28890d 100644
 +bsd/dev/hakios.battery.c	standard
 +bsd/dev/hakios.ufs.c	standard
 +bsd/dev/hakios.ufshc.c	standard
++bsd/dev/hakios.blazer_ufs.c	standard
++bsd/dev/hakios.blazer_cpm.c	standard
 +bsd/dev/hakios.net.c		standard
 +bsd/dev/hakios.ipa.c		standard
 +bsd/dev/hakios.cell.c		standard
@@ -107,7 +109,7 @@ index 44274016a4cf..be702e28890d 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +190,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +192,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -122,7 +124,7 @@ index 44274016a4cf..be702e28890d 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +404,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +406,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -130,7 +132,7 @@ index 44274016a4cf..be702e28890d 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +427,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +429,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -1657,7 +1659,7 @@ index 07aa0be4a0ca..3832eaff2184 100644
  		return err;
  	}
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
-index 2b14eda8f68f..09337bad5b01 100644
+index 2b14eda8f68f..5cbbe85a2b2f 100644
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
 @@ -32,6 +32,10 @@
@@ -1671,11 +1673,17 @@ index 2b14eda8f68f..09337bad5b01 100644
  const char * gIOKernelConfigTables =
      "("
      "   {"
-@@ -39,4 +43,11 @@ const char * gIOKernelConfigTables =
+@@ -39,4 +43,17 @@ const char * gIOKernelConfigTables =
      "     'IOProviderClass' = IOPlatformExpertDevice;"
      "     'IOProbeScore'    = 0:32;"
      "   }"
 +#if defined(__arm64__) && !defined(APPLE_ARM64_ARCH_FAMILY)
++    "   ,{"
++    "     'IOClass'         = BlazerPlatformExpert;"
++    "     'IOProviderClass' = IOPlatformExpertDevice;"
++    "     'IONameMatch'     = 'google,lga-blazer';"
++    "     'IOProbeScore'    = 10000:32;"
++    "   }"
 +    "   ,{"
 +    "     'IOClass'         = GenericARMPE;"
 +    "     'IOProviderClass' = IOPlatformExpertDevice;"
@@ -1684,10 +1692,18 @@ index 2b14eda8f68f..09337bad5b01 100644
 +#endif
      ")";
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index 5219fb0d9ed6..29978e9cff43 100644
+index 5219fb0d9ed6..dcc908591747 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -683,7 +683,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -61,6 +61,7 @@ extern "C" {
+ #endif
+ 
+ extern dev_t mdevadd(int devid, uint64_t base, unsigned int size, int phys);
++extern "C" int hakios_blazer_ufs_rootdev(dev_t *dev);
+ extern dev_t mdevlookup(int devid);
+ extern void mdevremoveall(void);
+ extern int mdevgetrange(int devid, uint64_t *base, uint64_t *size);
+@@ -683,7 +684,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  	assert(matching);
  	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
  
@@ -1703,7 +1719,7 @@ index 5219fb0d9ed6..29978e9cff43 100644
  		OSSafeReleaseNULL(service);
  	} else {
  		IOLog("!BSD\n");
-@@ -762,6 +769,17 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -762,6 +770,17 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  #endif /* __LP64__ */
  				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);        /* Initialize it and pass back the device number */
  			}
@@ -1721,6 +1737,27 @@ index 5219fb0d9ed6..29978e9cff43 100644
  			regEntry->release();                                                            /* Toss the entry */
  		}
  	}
+@@ -809,6 +828,20 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		}
+ 	}
+ 
++	/* Tensor G5's read-only, first-stage-live UFS root. An explicit request
++	 * fails closed rather than silently mounting a different partition. */
++	if (strcmp(rdBootVar, "ufsroot0") == 0) {
++		int error = hakios_blazer_ufs_rootdev(root);
++
++		if (error != 0) {
++			IOLog("IOFindBSDRoot: blazer UFS root unavailable: %d\n", error);
++			return kIOReturnError;
++		}
++		strlcpy(rootName, "ufsroot0", rootNameSize);
++		*oflags = 0;
++		goto iofrootx;
++	}
++
+ 	if ((!matching) && rdBootVar[0]) {
+ 		// by BSD name
+ 		look = rdBootVar;
 diff --git a/iokit/conf/files b/iokit/conf/files
 index 5fb0a52062e0..c07be8d9e0b0 100644
 --- a/iokit/conf/files
@@ -1882,20 +1919,22 @@ index 0316792a3f42..b9c195b09cd1 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..f91095c98d26 100644
+index e26a1d70f470..8edb115c6199 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -73,6 +73,9 @@
+@@ -73,6 +73,11 @@
  #include <sys/kdebug.h>
  
  #include <pexpert/pexpert.h>
 +#if defined(__arm64__)
 +#include <arm64/psci_smp.h>
++#include <arm64/hakios.blazer_panicdump.h>
++#include <arm64/hakios.blazer_display.h>
 +#endif
  
  #include <console/serial_protos.h>
  
-@@ -335,7 +338,11 @@ arm_setup_pre_sign(void)
+@@ -335,7 +340,11 @@ arm_setup_pre_sign(void)
   */
  
  __startup_func
@@ -1907,7 +1946,7 @@ index e26a1d70f470..f91095c98d26 100644
  arm_init(
  	boot_args       *args)
  {
-@@ -354,6 +361,7 @@ arm_init(
+@@ -354,6 +363,7 @@ arm_init(
  	const_boot_args = *args;
  	BootArgs = args = &const_boot_args;
  
@@ -1915,7 +1954,7 @@ index e26a1d70f470..f91095c98d26 100644
  	cpu_data_init(&BootCpuData);
  #if defined(HAS_APPLE_PAC)
  	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
-@@ -362,14 +370,19 @@ arm_init(
+@@ -362,14 +372,19 @@ arm_init(
  #endif /* defined(HAS_APPLE_PAC) */
  
  	PE_init_platform(FALSE, args); /* Get platform expert set up */
@@ -1935,7 +1974,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if (DEVELOPMENT || DEBUG)
  	unsigned long const *platform_stall_ptr = NULL;
-@@ -385,6 +398,7 @@ arm_init(
+@@ -385,6 +400,7 @@ arm_init(
  	}
  
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_ARM_INIT);
@@ -1943,7 +1982,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
  	dt_entry_size = 0;
-@@ -422,10 +436,13 @@ arm_init(
+@@ -422,10 +438,13 @@ arm_init(
  	}
  #endif
  
@@ -1957,7 +1996,7 @@ index e26a1d70f470..f91095c98d26 100644
  	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
  
  	BootCpuData.cpu_number = (unsigned short)master_cpu;
-@@ -439,11 +456,14 @@ arm_init(
+@@ -439,11 +458,14 @@ arm_init(
  	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
  	    + ((uintptr_t)&BootCpuData
  	    - (uintptr_t)(args->virtBase)));
@@ -1972,7 +2011,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/*
  	 * Preemption is enabled for this thread so that it can lock mutexes without
-@@ -452,12 +472,16 @@ arm_init(
+@@ -452,12 +474,16 @@ arm_init(
  	 * preemption level is not really meaningful for the bootstrap thread.
  	 */
  	thread->machine.preemption_count = 0;
@@ -1989,7 +2028,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/*
  	 * Initialize the timer callout world
-@@ -465,6 +489,7 @@ arm_init(
+@@ -465,6 +491,7 @@ arm_init(
  	timer_call_init();
  
  	cpu_init();
@@ -1997,7 +2036,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	processor_bootstrap();
  
-@@ -514,6 +539,7 @@ arm_init(
+@@ -514,6 +541,7 @@ arm_init(
  #endif  /* __ARM_PAN_AVAILABLE__ */
  
  	arm_vm_init(xmaxmem, args);
@@ -2005,7 +2044,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	if (debug_boot_arg) {
  		patch_low_glo();
-@@ -527,7 +553,9 @@ arm_init(
+@@ -527,9 +555,19 @@ arm_init(
  
  	/* Setup debugging output. */
  	const unsigned int serial_exists = serial_init();
@@ -2014,8 +2053,18 @@ index e26a1d70f470..f91095c98d26 100644
 +	loader_checkpoint(19);
  	kprintf("kprintf initialized\n");
  
++	/* Validate a first-stage framebuffer record before the console is created.
++	 * This reads only the record and its exclusions, never a display register. */
++	hakios_blazer_display_init();
++
++	/* Explicit blazer handoff only: map ramoops and arm the guarded capture.
++	 * With no boot-arg this is a no-op on every other board. */
++	hakios_blazer_panicdump_init();
++
  	serialmode = 0;
-@@ -569,6 +597,7 @@ arm_init(
+ 	if (PE_parse_boot_argn("serial", &serialmode, sizeof(serialmode))) {
+ 		/* Do we want a serial keyboard and/or console? */
+@@ -569,6 +607,7 @@ arm_init(
  		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
  	}
  	PE_create_console();
@@ -2023,7 +2072,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/* setup console output */
  	PE_init_printf(FALSE);
-@@ -647,6 +676,7 @@ arm_init(
+@@ -647,6 +686,7 @@ arm_init(
  	 * against string vulnerabilities
  	 */
  	__stack_chk_guard &= ~(0xFFULL << 8);
@@ -2031,7 +2080,7 @@ index e26a1d70f470..f91095c98d26 100644
  	machine_startup(args);
  }
  
-@@ -673,6 +703,9 @@ arm_init_cpu(
+@@ -673,6 +713,9 @@ arm_init_cpu(
  
  
  	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
@@ -2042,10 +2091,18 @@ index e26a1d70f470..f91095c98d26 100644
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
 diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
-index 39daaf8db949..64ceb1a5f201 100644
+index 39daaf8db949..4829ecd7b1dd 100644
 --- a/osfmk/arm/model_dep.c
 +++ b/osfmk/arm/model_dep.c
-@@ -79,6 +79,9 @@
+@@ -48,6 +48,7 @@
+ #include <kern/debug.h>
+ #include <kern/processor.h>
+ #include <kdp/kdp_core.h>
++#include <arm64/hakios.blazer_panicdump.h>
+ #if ALTERNATE_DEBUGGER
+ #include <arm64/alternate_debugger.h>
+ #endif
+@@ -79,6 +80,9 @@
  #include <arm/cpu_data_internal.h>
  #include <arm/cpu_internal.h>
  #include <arm/misc_protos.h>
@@ -2055,7 +2112,19 @@ index 39daaf8db949..64ceb1a5f201 100644
  #include <libkern/OSKextLibPrivate.h>
  #include <vm/vm_kern.h>
  #include <kern/kern_cdata.h>
-@@ -1156,6 +1159,13 @@ wait_while_mp_kdp_trap(bool check_SIGPdebug)
+@@ -631,6 +635,11 @@ do_print_all_backtraces(const char *message, uint64_t panic_options)
+ 		    "frame pointer outside kernel vm.\n");
+ 	}
+ 
++	/* Capture the complete string + backtrace before kext/vnode/stackshot
++	 * sections. A later, longer rung supersedes the early string-only record. */
++	hakios_blazer_panicdump_capture(message, debug_buf_base,
++	    (vm_size_t)(debug_buf_ptr - debug_buf_base));
++
+ 	paniclog_append_noflush("\n");
+ 	if (filesetKC) {
+ 		kext_dump_panic_lists(&paniclog_append_noflush);
+@@ -1156,6 +1165,13 @@ wait_while_mp_kdp_trap(bool check_SIGPdebug)
  			found_SIGPdebug = true;
  			break;
  		}
@@ -2734,7 +2803,7 @@ index 9d98c50094a0..9e3476124e54 100644
 +osfmk/minicrypto/mc_provider.c	standard
 +osfmk/minicrypto/mc_aes.c	standard
 diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
-index c40d57bcc677..1b7a1fcdfcdf 100644
+index c40d57bcc677..f878c23d52c0 100644
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
 @@ -25,8 +25,8 @@ osfmk/arm64/WKdmCompress_4k.s	standard
@@ -2748,12 +2817,15 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
  osfmk/arm64/bcopy.s standard
  osfmk/arm64/bzero.s standard
  osfmk/arm/caches.c		standard
-@@ -104,3 +104,8 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
+@@ -104,3 +104,11 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
  osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
  
  osfmk/arm/counter.c	standard
 +osfmk/arm64/generic_arm64_support.c	optional nos_arm_asm
 +osfmk/arm64/loader_return.c	optional nos_arm_asm
++osfmk/arm64/hakios.blazer_panicdump.c	optional nos_arm_asm
++osfmk/arm64/laguna_display_handoff.c	optional nos_arm_asm
++osfmk/arm64/hakios.blazer_display.c	optional nos_arm_asm
 +osfmk/arm64/user_exception_trace.c	standard
 +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
 +osfmk/arm64/psci_smp.c	optional nos_arm_asm
@@ -2776,10 +2848,18 @@ index 384118e8d7a9..2573d2ebd4e6 100644
  				 * io_map doesn't support.  However this buffer is set up
  				 * by the bootloader and doesn't require D$ cleaning, so
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
-index 0a00656a0fdd..bfad3cbca5bc 100644
+index 0a00656a0fdd..e7ed5008b353 100644
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
-@@ -1147,9 +1147,12 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+@@ -84,6 +84,7 @@
+ #include <stdatomic.h>
+ #include <sys/pgo.h>
+ #include <console/serial_protos.h>
++#include <arm64/hakios.blazer_panicdump.h>
+ #include <IOKit/IOBSD.h>
+ 
+ #if !(MACH_KDP && CONFIG_KDP_INTERACTIVE_DEBUGGING)
+@@ -1147,9 +1148,12 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
  	__builtin_unreachable();
  }
  
@@ -2792,7 +2872,7 @@ index 0a00656a0fdd..bfad3cbca5bc 100644
  	for (;;) {
  #if defined(__arm__) || defined(__arm64__)
  		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */
-@@ -1163,6 +1166,7 @@ panic_spin_forever(void)
+@@ -1163,6 +1167,7 @@ panic_spin_forever(void)
  static void
  kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags)
  {
@@ -2800,6 +2880,17 @@ index 0a00656a0fdd..bfad3cbca5bc 100644
  	if ((type == kPEPanicRestartCPU) && (debugger_flags & DEBUGGER_OPTION_SKIP_PANICEND_CALLOUTS)) {
  		PEHaltRestart(kPEPanicRestartCPUNoCallouts);
  	} else {
+@@ -1279,6 +1284,10 @@ debugger_collect_diagnostics(unsigned int exception, unsigned int code, unsigned
+ #pragma clang diagnostic pop
+ 		}
+ 		paniclog_append_noflush("\n");
++		/* Early rung: preserve the panic string even if backtrace collection
++		 * aborts. The capture's nofault guards keep this path bounded. */
++		hakios_blazer_panicdump_capture(debugger_panic_str, debug_buf_base,
++		    (vm_size_t)(debug_buf_ptr - debug_buf_base));
+ 	}
+ #if defined(__x86_64__)
+ 	else if (((debugger_current_op == DBOP_DEBUGGER) && debugger_is_panic)) {
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
 index 809dafaaa2a7..71c6580f44e2 100644
 --- a/osfmk/kern/exception.c
@@ -3120,6 +3211,41 @@ index 3ad743fc3efb..ce036c5a2c26 100644
  #else
  void
  pe_init_fiq()
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index c622b4cc84ab..6b6ec2dcc045 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -79,6 +79,10 @@ struct macos_panic_header *mac_panic_header = NULL;
+ /* Maximum size of panic log excluding headers, in bytes */
+ static unsigned int panic_text_len;
+ 
++/* Blazer's kexec/ADT path may have no iBoot pram node. This fallback is used
++ * only with the explicit blazer_panicdump=1 handoff; a real pram always wins. */
++static uint8_t blazer_panic_region[0x80000] __attribute__((aligned(4096)));
++
+ /* Whether a console is standing by for panic logging */
+ static boolean_t panic_console_available = FALSE;
+ 
+@@ -93,6 +97,19 @@ void PE_slide_devicetree(vm_offset_t);
+ static void
+ check_for_panic_log(void)
+ {
++	uint32_t blazer_fallback = 0;
++
++	if (PE_parse_boot_argn("blazer_panicdump", &blazer_fallback,
++	    sizeof(blazer_fallback)) && blazer_fallback != 0) {
++		DTEntry pram_entry;
++
++		if (kSuccess != SecureDTLookupEntry(0, "pram", &pram_entry)) {
++			gPanicBase = (vm_offset_t)blazer_panic_region;
++			gPanicSize = sizeof(blazer_panic_region);
++			panic_text_len = gPanicSize - sizeof(struct embedded_panic_header);
++			return;
++		}
++	}
+ #ifdef PLATFORM_PANIC_LOG_PADDR
+ 	gPanicBase = ml_io_map_wcomb(PLATFORM_PANIC_LOG_PADDR, PLATFORM_PANIC_LOG_SIZE);
+ 	panic_text_len = PLATFORM_PANIC_LOG_SIZE - sizeof(struct embedded_panic_header);
 diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
 index 65144c74239c..ab6260d52d84 100644
 --- a/pexpert/arm/pe_kprintf.c

@@ -33,6 +33,7 @@ kern_return_t psci_smp_start_cpu(int cpu);
 void psci_smp_cpu_running(void);
 void psci_smp_cpu_off(void) __dead2;
 void gic_v3_irq_signal(uint32_t phys_id);
+void hakios_blazer_panicdump_bootdone(void);
 }
 
 /*
@@ -303,6 +304,9 @@ GenericARMPE::start(IOService * provider)
 	MiniIOMobileFramebufferStart(this);
 	MiniAppleKeyStoreStart();
 	MiniIONetworkStackStart();
+	/* The registry and Mini globals are live; only an explicit test arg can
+	 * now create the ramoops validation thread. Capture itself stays gated. */
+	hakios_blazer_panicdump_bootdone();
 	return true;
 }
 
@@ -405,3 +409,17 @@ GenericARMPE::getMachineName(char * name, int maxLength)
 	}
 	return true;
 }
+
+/*
+ * Tensor G5 (Pixel 10 Pro, "blazer"). This deliberately inherits the whole
+ * generic bring-up: CPU registration, IOResources setup and the Mini* start
+ * calls. The board personality only selects this expert for the loader's
+ * google,lga-blazer root; it must not bypass GenericARMPE::start() with a second
+ * set of IOResources personalities (the old native 0018/0019 failure class).
+ */
+class BlazerPlatformExpert : public GenericARMPE
+{
+	OSDeclareDefaultStructors(BlazerPlatformExpert);
+};
+
+OSDefineMetaClassAndStructors(BlazerPlatformExpert, GenericARMPE);

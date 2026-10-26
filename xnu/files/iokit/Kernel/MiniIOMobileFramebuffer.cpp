@@ -38,6 +38,8 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include "MiniIOSurface.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
+extern "C" bool hakios_blazer_display_clean_on_present(void);
+extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -48,12 +50,16 @@ enum {
 	kFBMethodGetID                  = 7,
 	kFBMethodGetDisplaySize         = 8,
 	kFBMethodRequestPowerChange     = 12,
+	kFBMethodSetDisplayConfig       = 17,
 	kFBMethodSwapSignal             = 20,
 	kFBMethodGetDigitalOutState     = 25,
+	kFBMethodGetDisplayConfig       = 27,
 	kFBMethodGetDotPitch            = 28,
 	kFBMethodGetDisplayArea         = 29,
+	kFBMethodSetDisplayParameter    = 50,
 	kFBMethodSwapCancel             = 52,
 	kFBMethodGetColorRemapMode      = 57,
+	kFBMethodSetDisplayConfigFlags  = 68,
 	kFBMethodNotifications          = 72,
 	kFBMethodChangeFrameInfo        = 73,
 	kFBMethodSupportedFrameInfo     = 74,
@@ -61,6 +67,7 @@ enum {
 	kFBMethodGetBlock               = 79,
 	kFBMethodSwapCancelAll          = 81,
 	kFBMethodGetProtectionOptions   = 82,
+	kFBMethodSetDisplayConfigOption = 84,
 };
 
 /* The swap request (IOMobileFramebufferSwapEnd): 0x46c bytes, of which we read these. */
@@ -87,6 +94,10 @@ enum {
 
 static uint64_t gFBLogged[2];           /* selectors already reported */
 static uint8_t  gFBCalls[128];          /* how many calls of each selector were traced */
+/* The 27/17 display-configuration pair is state, not a success-with-zeroes
+ * answer. WindowServer gets a zeroed block until its first setter call. */
+static uint8_t  gFBConfigBlock[4096];
+static uint32_t gFBConfigSize;
 
 /*
  * The display user space is told about. The system carries the identity of the iPhone X
@@ -113,6 +124,8 @@ static TUNABLE(uint32_t, gFBHeight, "fbheight", kFBDefaultHeight);
 static TUNABLE(uint32_t, gFBScale, "fbscale", 0);
 /* Boot-arg fbtrace=N: log the first N calls of every selector (default 3). */
 static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
+/* The display-subsystem nub's compatible is board data, not a driver match. */
+static TUNABLE_STR(gFBCompatible, 64, "fb_compatible", "redwood,framebuffer");
 
 /*
  * A recording of the screen, for a machine one cannot look at while it runs (the phone is
@@ -1039,6 +1052,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
+	/* All presenter/helper writes are complete here. A first-stage WC mapping
+	 * needs a barrier; CLEAN_ON_PRESENT additionally cleans the scanout to PoC. */
+	if (hakios_blazer_display_clean_on_present()) {
+		FlushPoC_DcacheRegion((vm_offset_t)fBase, (size_t)fRowBytes * fPanelHeight);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
 		record(recorded);
@@ -1407,6 +1426,45 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		args->scalarOutputCount = 1;
 		return kIOReturnSuccess;
 
+	case kFBMethodGetColorRemapMode:
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = 0;                         /* standard sRGB remap (none) */
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodSetDisplayConfig:               /* the setter twin of selector 27 */
+		if (args->structureInputSize > sizeof(gFBConfigBlock)) {
+			return kIOReturnBadArgument;
+		}
+		if (args->structureInputSize != 0) {
+			if (args->structureInput == NULL) {
+				return kIOReturnBadArgument;
+			}
+			memcpy(gFBConfigBlock, args->structureInput, args->structureInputSize);
+		}
+		gFBConfigSize = args->structureInputSize;
+		return kIOReturnSuccess;
+
+	case kFBMethodGetDisplayConfig:               /* out: the block selector 17 last set */
+		if (args->structureOutput == NULL) {
+			return kIOReturnBadArgument;
+		}
+		bzero(args->structureOutput, args->structureOutputSize);
+		if (gFBConfigSize != 0) {
+			uint32_t n = args->structureOutputSize < gFBConfigSize ?
+			    args->structureOutputSize : gFBConfigSize;
+
+			memcpy(args->structureOutput, gFBConfigBlock, n);
+		}
+		return kIOReturnSuccess;
+
+	case kFBMethodSetDisplayParameter:
+	case kFBMethodSetDisplayConfigFlags:
+	case kFBMethodSetDisplayConfigOption:
+		return kIOReturnSuccess;                 /* set-only requests on the one fixed mode */
+
 	default:
 		break;
 	}
@@ -1452,7 +1510,7 @@ publishDisplayNode(void)
 		data = OSData::withBytes("display-subsystem", sizeof("display-subsystem"));
 		props->setObject("device_type", data);
 		OSSafeReleaseNULL(data);
-		data = OSData::withBytes("redwood,framebuffer", sizeof("redwood,framebuffer"));
+		data = OSData::withBytes(gFBCompatible, (uint32_t)strnlen(gFBCompatible, sizeof(gFBCompatible)) + 1);
 		props->setObject("compatible", data);
 		OSSafeReleaseNULL(data);
 		data = OSData::withBytes("disp0", sizeof("disp0"));

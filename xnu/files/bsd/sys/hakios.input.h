@@ -43,6 +43,8 @@ void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio
 void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
 void hakios_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
 void hakios_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
+void hakios_blazer_ufs_init(void);    /* blazer_ufs=1/2 + blazer_ufs_live=1: Tensor G5 storage probe/takeover */
+void hakios_blazer_cpm_init(void);    /* blazer_cpm=1, writes only with blazer_cpm_tx=1: Tensor CPM queue */
 void hakios_ufs_report(const char *when); /* where reading the storage has spent its time so far */
 bool hakios_ufs_dev(dev_t dev);           /* one of the storage's devices */
 int hakios_ufs_read_partition(const char *name, uint64_t offset, uint8_t *dst, uint64_t len, uint64_t *bytes); /* for drivers */

@@ -1,0 +1,14 @@
+blazer_ufs_base=0x3c400000
+blazer_ufs_top_base=0x3c410000
+blazer_ufs_psm_hsios=0x3c00b108
+blazer_ufs_psm_hc=0x3c00d210
+blazer_ufs_psm_phy=0x3c00e108
+blazer_cpm_global=0x5250000
+blazer_cpm_req=0x5260000
+blazer_cpm_resp=0x5261000
+blazer_ramoops_base=0x95200000
+blazer_ramoops_size=0x400000
+blazer_console_size=0x200000
+blazer_pmsg_base=0x95400000
+blazer_pmsg_size=0x200000
+fb_compatible=google,lga-framebuffer

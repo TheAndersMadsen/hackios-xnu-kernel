@@ -2,34 +2,42 @@
 
 This is the working map of what the port needs and where each piece lives.
 It is meant for someone picking up a task, not as a history log.
+Build and handoff details live in `docs/BUILD.md` and `docs/BOOT-CONTRACT.md`.
+Checked boxes mean implemented in source on this branch; they do not imply an
+on-device validation claim.
 
 ## 1. Platform layer
 
-- [ ] A `LagunaPlatformExpert` matching `google,lga-blazer` (the boot must not
-      fall through to `GenericARMPE::start()`, or the Mini* stand-ins never
-      start — that was the systemic SIGTRAP root cause on the native tree).
-- [ ] `IOResources` personalities in `gIOKernelConfigTables` for the Mini*
-      stand-ins (the 0018/0019 pattern):
-      - `MiniAppleKeyStore` (kills the MobileKeyBag `MKBEventsRegister` trap),
-      - `MiniIOMFB` + `IOCoreSurfaceRoot` (the display-config contract),
-      - `MiniIOSurface` globals initialized in `IOCoreSurfaceRoot::start()`
-        before `registerService()` (avoids the `lck_mtx_lock(NULL)` panic).
-- [ ] AMFI op `0x5a` (the dyld-policy check) answered with `0xff` under the
-      exact policy name `AMFI`; without it, `DYLD_INSERT_LIBRARIES` /
-      `kern.exec_inject` carriers are refused.
-- [ ] A permissive-but-logged sandbox policy (privileges granted, extension
-      issue/consume as no-ops) for the early bring-up.
-- [ ] The kexec entry contract: raw `kexec_load` delivers `x0 = 0`, so the
-      entry stub must be patched to take `boot_args` from the pmsg zone and
-      to write the `0x5A5A5A5A` entry marker + a MARKER-SCRATCH record.
+- [x] `BlazerPlatformExpert` matches `google,lga-blazer` and **inherits** the
+      complete `GenericARMPE::start()`. On the new foundation that parent starts
+      the Mini* services directly after the registry is live; the native
+      0018/0019 IOResources workaround is not a second patch layer to import.
+- [x] The inherited Mini* stand-ins are preserved: `MiniAppleKeyStore`,
+      `MiniIOMFB` + `IOCoreSurfaceRoot`, and `MiniIOSurface` globals initialized
+      before `IOCoreSurfaceRoot` registration. There is exactly one initialization
+      path, so the old `lck_mtx_lock(NULL)` class is not reintroduced.
+- [x] AMFI op `0x5a` is already answered with `0xff` under the exact policy
+      name `AMFI` by the foundation's `kern_minimac.c`; no second AMFI driver.
+- [x] The foundation's permissive-but-logged Sandbox policy supplies the early
+      privilege answers and no-op extension handling.
+- [x] `tools/patch-xnu-marker.py` implements the dual entry contract: raw
+      `kexec_load` x0=0 gets `boot_args` through `XNH0` in pmsg, direct x0=PA
+      stays valid, and the marker/scratch slots are documented in
+      `docs/BOOT-CONTRACT.md`.
 
 ## 2. Display / DPU
 
-- [ ] CPM mailbox transport (`files/laguna_mbox.c`): queue-based goog-mba v2,
-      TX `0x05260000`, RX `0x05261000`, polled-first, boot-arg gated.
+- [x] CPM mailbox transport (`xnu/files/bsd/dev/hakios.blazer_cpm.c`):
+      queue-based goog-mba v2, TX `0x05260000`, RX `0x05261000`, polled-first,
+      `blazer_cpm=1` read-only plus separate `blazer_cpm_tx=1` write gate.
+      `files/laguna_mbox.c` remains the reference snippet, not a patch stack.
 - [ ] DPU power-on sequence, then a live scanout address — **without** the
       DC9x00 readback (see `SAFETY.md`: it is a RAS crash on real silicon).
-- [ ] `MiniIOMFB` display-config selectors answered: 57 (color remap),
+- [x] The XNU-side display handoff is implemented: the 128-byte CRC'd record is
+      validated before video changes; invalid records go headless, GOP/ramfb is
+      preserved when no record exists, and CLEAN_ON_PRESENT/WC have distinct
+      presenter cache paths. See `docs/BOOT-CONTRACT.md` for the forbidden ranges.
+- [x] `MiniIOMFB` display-config selectors answered: 57 (color remap),
       27/17 (the 3084-byte get/set twin over a shadow block), 84/50/68 accept.
       This is what lets backboardd probe without a FrontBoardServices assert.
 - [ ] A software renderer into the scanout (Mesa softpipe) and the
@@ -41,8 +49,9 @@ It is meant for someone picking up a task, not as a history log.
 
 ## 3. Root + userland image
 
-- [ ] `RAMDisk → md0` ADT contract (byte-for-byte), `rd=md0 rootrw=1`,
-      `ignition_level=1 launchd_unsecure_cache=1`.
+- [x] `RAMDisk → md0` ADT contract (byte-for-byte), `rd=md0 rootrw=1`,
+      `ignition_level=1 launchd_unsecure_cache=1`; exact layout and span checks
+      are in `docs/BOOT-CONTRACT.md`.
 - [ ] The full dyld shared cache at `/System/Library/Caches/com.apple.dyld`,
       every file owned by **uid 0** (XNU refuses the shared region otherwise).
 - [ ] No `/usr/lib/system/libdispatch.dylib` on disk (dyld-1042 override rule).
@@ -62,11 +71,10 @@ It is meant for someone picking up a task, not as a history log.
       reset/rails, TCM generation detect, SSI clock liveness.
 - [ ] UFS: root storage and the F2FS read-only mount in the ladder's Linux
       stage (`CONFIG_F2FS_FS=y` is required in that kernel).
-- [ ] ramoops/pmsg panic capture: on panic, append the panic string +
-      backtrace + msgbuf tail into the ramoops console zone (PA `0x95200000`,
-      Linux persistent_ram ring semantics) plus a CRC'd mirror at
-      pmsg+`0x30000`; handle the missing `pram` node (`gPanicBase = 0`) with a
-      static fallback so `SavePanicInfo` cannot spin.
+- [x] ramoops/pmsg panic capture (`hakios.blazer_panicdump`): opt-in
+      `blazer_panicdump=1`, early+full nofault-guarded capture rungs, persistent_ram
+      console append plus the CRC'd pmsg mirror. The missing-`pram` case uses a
+      static 512 KiB fallback only when explicitly enabled; a real `pram` wins.
 
 ## 5. Delivery and evidence
 

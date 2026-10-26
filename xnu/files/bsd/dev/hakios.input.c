@@ -220,6 +220,8 @@ hakios_input_init(void)
 	hakios_buttons_init();
 	hakios_battery_init();
 	hakios_ufs_init();
+	hakios_blazer_ufs_init();
+	hakios_blazer_cpm_init();
 	hakios_net_init();
 	hakios_adreno_init();
 	hakios_wifi_init();

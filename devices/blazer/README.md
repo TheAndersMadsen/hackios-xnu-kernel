@@ -134,6 +134,9 @@ appended last so `rdinit=/xni` wins. Do not “fix” this by touching `init_boo
 | [`files/`](files/) | laguna driver sources (mailbox first) |
 | [`tools/`](tools/) | device-tree and log tools |
 | [`docs/PORTING.md`](docs/PORTING.md) | the full porting checklist and current wall map |
+| [`docs/BUILD.md`](docs/BUILD.md) | clean kernel build, marker and host-validation recipe |
+| [`docs/BOOT-CONTRACT.md`](docs/BOOT-CONTRACT.md) | kexec/direct entry, ADT, boot-args and RAMDisk→md0 |
+| [`soc.args`](soc.args) | FDT-generated Tensor handoff addresses (no Qualcomm `soc_*`) |
 | [`docs/SAFETY.md`](docs/SAFETY.md) | the on-device safety rails — read first |
 
 Nothing here is an iOS binary, image, cache, font, picture or the phone's
