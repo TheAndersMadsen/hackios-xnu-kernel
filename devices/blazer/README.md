@@ -44,6 +44,10 @@ answer, the Mesa/GLI renderer path, the userland image build, and the
 | --- | --- |
 | XNU entry on the phone (kexec ladder) | ✅ Proven ×4 on real hardware (entry marker `0x5A5A5A5A`) |
 | Direct tegu-style shim → XNU | ✅ Reaches the kernel; watchdog + fault-screen console |
+| **Evidence channels (death instrumentation)** | ✅ Done — always-on XNU msgbuf mirror (XNU-MSGBUF v1, Mach `cae95ab12…`), USB EP0 console shim host-validated 306/306 (+ASan/UBSan), ramdump reader v2 57/57 — [`porting-kit/`](porting-kit/) |
+| **On-device delivery chain** | ✅ Proven on hardware — probe → 14 kexec segments → `kexec_load result=0` → XNU handoff magic `0x30484e58` at pmsg+`0x120` |
+| **Current blocker** | 🚧 XNU dies before `arm_vm_init` on laguna hardware — silently to every live console; the death is visible only through the post-mortem channels |
+| **Next instrument** | ⬜ Shim-direct USB-console boot — the polled EP0 gadget is the only channel that survives death (measured map: [`porting-kit/EVIDENCE-CHANNELS.md`](porting-kit/EVIDENCE-CHANNELS.md)) |
 | **Stock iOS lock screen renders (blazer kernel, QEMU)** | ✅ Composited, updating lock screen; zero panics; SpringBoard up in 26.75 s |
 | launchd + root mount in QEMU | ✅ APFS and HFS roots, full daemon set (173 daemons spawned) |
 | backboardd → scanout in QEMU | ✅ Display pipeline works end-to-end |
@@ -153,6 +157,7 @@ appended last so `rdinit=/xni` wins. Do not “fix” this by touching `init_boo
 | [`fdt/`](fdt/) | the phone's device tree |
 | [`files/`](files/) | laguna driver sources (mailbox first) |
 | [`tools/`](tools/) | device-tree and log tools, plus [`tools/dslocal/`](tools/dslocal/README.md) — the identity-record staging kit any port can reuse |
+| [`porting-kit/`](porting-kit/) | the folded death-instrumentation kit — msgbuf-mirror patch + format contract, standalone ramdump reader, USB EP0 console runbooks, and the measured pmsg evidence-channel map |
 | [`docs/PORTING.md`](docs/PORTING.md) | the full porting checklist and current wall map |
 | [`docs/BUILD.md`](docs/BUILD.md) | clean kernel build, marker and host-validation recipe |
 | [`docs/BOOT-CONTRACT.md`](docs/BOOT-CONTRACT.md) | kexec/direct entry, ADT, boot-args and RAMDisk→md0 |

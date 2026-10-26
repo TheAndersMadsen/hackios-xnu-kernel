@@ -1,0 +1,5 @@
+#!/bin/sh
+# Host-only synthetic DRAM validation; never invokes device/QEMU tooling.
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "$HERE/read-ramdump.py" --selftest "$@"
