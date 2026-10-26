@@ -95,3 +95,18 @@ __pycache__/
 /xnuloader/identity.h
 !/xnuloader/im4p.py
 !/xnuloader/mkidentity.sh
+
+# --- laguna / blazer port: local artifacts, never committed ---
+fw-*/
+*.ipsw
+*.dmg
+*.hfs
+*.apfs
+*.img
+*.macho
+*.bin
+*.raw
+logs/
+out/
+work/
+evidence/
