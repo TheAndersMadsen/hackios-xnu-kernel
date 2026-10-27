@@ -9,6 +9,14 @@
 # reply, success = reply dword1 == 0), and (c) performs the EL2->EL1 drop at
 # the final jump (tegu_el_drop_and_jump, el-drop stamps as the last evidence).
 # The wire truth behind these constants is in ../evidence-channels/.
+#
+# 2026-10-27 (v51 generation / payload admission): the payload is delivered as
+# an EMBEDDED TEGUPLD1 envelope glued after the shim Image by shim/build.sh
+# (which also raises the arm64 image_size to cover it); the ABL ramdisk is an
+# empty cpio (ramdisk_size=0 semantics — shipping the payload twice busts the
+# 64 MiB AVB budget, the v46 lesson). The kernel window is 0xd0000000 +
+# 0x0A000000 (32 MiB-aligned, 92.1 MiB kernel + 64 MiB headroom; the full
+# window-selection story is ../evidence-channels/PAYLOAD-ADMISSION.md §4).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 LANE="$ROOT/research/laguna-usb-console"
@@ -47,7 +55,7 @@ if len(root_data) != 25165824 or hashlib.sha256(root_data).hexdigest() != \
 PY
 
 mkdir -p "$OUT"
-python3 "$TL/mkadt.py" "$OUT/laguna.adt" --mem-size=0x10000000
+python3 "$TL/mkadt.py" "$OUT/laguna.adt" --phys-base=0xd0000000 --mem-size=0x0A000000
 CMDLINE='debug=0x8 serial=3 cpus=1 io.display.iomfb=1 rd=md0 rootrw=1 ignition_level=1 launchd_unsecure_cache=1 kern.jetsam_critical_threshold=1 interrupt-masked-debug-mode=1 lagunalogdump=1'
 python3 "$TL/mkpayload.py" "$R4_MACHO" "$OUT/laguna.adt" "$OUT/payload-usb.bin" \
     --cmdline "$CMDLINE" --ramdisk "$ROOTFS"
