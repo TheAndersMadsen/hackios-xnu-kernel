@@ -1,21 +1,40 @@
 # Porting kit — death instrumentation for the laguna bring-up
 
-> **STATUS (2026-10-27, attempt v54): XNU PASSES PE INIT — NEW WALL = NVRAM.**
-> Latest milestone: v54 (ADT with `/options` + G2 nodes) **PASSED
-> `IOPlatformExpert.cpp:1695`** — the v51 `gIOOptionsEntry` assert is retired —
-> with on-device proof `pe_arm_map_interrupt_controller: found
-> interrupt-controller` + `found timer`, then the full ladder (VM bootstrap,
-> ATM/Firehose/OSLog, scheduler clutch, serial KDP, `iBoot version:
-> laguna-shim`). **Current blocker: `IONVRAMCHRPHandler creation failed`** —
-> `IONVRAM.cpp:getNVRAMProperties:1151` can't find `nvram-bank-size`, so the
-> ADT needs `nvram-bank-size` + NVRAM properties (and whatever
-> `IONVRAMCHRPHandler::init` reads next) → `MACH Reboot`, auto-parked in
-> fastboot. Fully captured (mirror v2 breadcrumbs `XNU_ENTRY(6)→XNU_INIT(7)→
-> PANIC(12)`, reader verdict `PANICKED | XNU entered=yes`). See
+> **STATUS (2026-10-27, wave v56-prep): NVRAM WALL FIXED IN v55 — BLOCKER =
+> NEXT POST-NVRAM WALL (device attempt v55 pending — phone reconnect).**
+> Latest milestone: **v55** (kernel sha `00c23ba634495784…`) is built with
+> the NVRAM CHRP fix — 4 props on `/chosen` (`nvram-bank-size=0x2000`,
+> `nvram-bank-count=1`, `nvram-current-bank=0`, 8 KiB valid CHRP v1
+> `nvram-proxy-data`; adler32 + CHRP checksums exact — the kernel panics on
+> drift) — AVB-verified and **QEMU-validated past the NVRAM wall**: boot
+> now runs on to `MiniIOMobileFramebuffer` attach (the new QEMU frontier).
+> **Current blocker: the next post-NVRAM wall** — candidates: IOKit
+> `/arm-io` driver matching, AMFI `/chosen` policy
+> (`amfi-only-platform-code`, pandora precedent), display attach, CPU
+> registration, root mount. Device attempt v55 was **STAGED-NOT-BOOTED**
+> (2026-10-27 12:19: phone absent, runner aborted safely pre-flight — no
+> device result claimed); it fires the moment the phone returns.
+> On-device wall history: v54 (ADT with `/options` + G2 nodes) **PASSED
+> `IOPlatformExpert.cpp:1695`** — the v51 `gIOOptionsEntry` assert is
+> retired — with on-device proof `pe_arm_map_interrupt_controller: found
+> interrupt-controller` + `found timer`, then the full ladder to
+> `iBoot version: laguna-shim`, then **`IONVRAMCHRPHandler creation
+> failed`** (`IONVRAM.cpp:getNVRAMProperties:1151`, no `nvram-bank-size`)
+> → `MACH Reboot`, auto-parked in fastboot. Fully captured (mirror v2
+> breadcrumbs `XNU_ENTRY(6)→XNU_INIT(7)→PANIC(12)`, reader verdict
+> `PANICKED | XNU entered=yes`). See
+> [`evidence-lab/INIT-NVRAM.md`](evidence-lab/INIT-NVRAM.md) (the NVRAM
+> panic dissected to file:line, plus the exact fix v55 ships),
 > [`evidence-lab/INIT-ASSERTION.md`](evidence-lab/INIT-ASSERTION.md) (1695
 > wall, retired), [`evidence-lab/ADT-NODES.md`](evidence-lab/ADT-NODES.md)
-> (what the ADT now emits), and the v53/v54 rows of
-> [`evidence-lab/ATTEMPTS.md`](evidence-lab/ATTEMPTS.md).
+> (what the ADT now emits), and the v53–v55 rows of
+> [`evidence-lab/ATTEMPTS.md`](evidence-lab/ATTEMPTS.md). Root side:
+> **root-v7 opt-in integration is ready** — `WITH_ROOT7=1` on
+> [`usb-console/build-next-boot.sh`](usb-console/build-next-boot.sh)
+> carries the 28 MiB root-v7 (sha `72bf50b9…`) by raising the ADT window
+> to `--mem-size=0x0A400000` (extra RAM claim needs device validation
+> later); recipe, geometry, and honesty notes in
+> [`usb-console/ROOT-INTEGRATION.md`](usb-console/ROOT-INTEGRATION.md).
 
 Everything in this directory is folded from today's validated research lanes so
 other porters can use it without the research workspace. Host-only unless a
@@ -32,8 +51,8 @@ evidence channels as one verified system, with per-outcome command blocks.
 | [`mirror-panic-capture/`](mirror-panic-capture/) | `0001-laguna-0129-*.patch` — always-on XNU msgbuf mirroring + RAM-dump stages (apply to an XNU 8796 tree); `XNU-MSGBUF-v1.md` — the header/ring wire contract | R4 panic-capture lane. Validated Mach-O hash `cae95ab12…` (15,102,200 B); QEMU default-on 12/12 mirror checks, opt-out 5/5, host selftests 11/11. Superseded on device by the v2 relocation (header pmsg+0x3F800) — the reader and runbook handle both |
 | [`ramdump-reader/`](ramdump-reader/) | `read-ramdump.py` + `./selftest` — standalone DRAM/pstore-aperture reader: persistent_ram linearization, PAN1 channels, XNU-MSGBUF v1 mirror, LGLW stage breadcrumbs, symbolication, one mechanical verdict line | R2 ramdump lane, v2-era copy. **57/57 selftest** from this directory. `decode-device-panic.py` and `make-r2-fixtures.py` ship alongside so the kit is self-contained. Note: this copy predates the v2 relocation — it decodes the v1 layout only; for `XNU-MSGBUF v2` (header pmsg+0x3F800) use the updated research reader or the layout notes in [`usb-console/RUNBOOK.md`](usb-console/RUNBOOK.md) §8 |
 | [`usb-console/`](usb-console/) | The polled DWC3 EP0 diagnostic console: `PROTOCOL.md`, `BRINGUP.md`, `HARDWARE-ENABLE.md`, `RUNBOOK.md` (v51 flow: force-fastboot REQUIRED, **embedded TEGUPLD1 envelope + `image_size` raise**, window `0xd0000000+0x0A000000`, warm-skip (GSNPSID-only verdict) + corrected LPCM cold path, expected stamp trails incl. the admission refusal dictionary and the XNU-boots success branch), `build-next-boot.sh` | A3/S1 USB console lane. Shim host-validated; on device 2026-10-27 EP0 enumeration is deterministic (v39–v51 every run) and v51 carried XNU through admission to a running kernel. `build-next-boot.sh` accepts v1/v2 machs and embeds the payload (`ramdisk_size = 0` semantics — the v46 64 MiB-budget lesson) |
-| [`evidence-lab/`](evidence-lab/) | The reproducible experiment pattern: `EVIDENCE-MAP.md` (channel×offset×decoder table + per-outcome command blocks), `decode-shim-stamps.py` (TSHIMST1/2 trail decoder, selftest included), `run-attempt.sh` (ONE command per device attempt: arm → boot → watch → park → collect → decode → one-line verdict), `ATTEMPTS.md` (the attempt ledger: 2026-10-26/27 backfill, v36–v38, and the **v39–v51 EP0-determinism + payload-admission campaign** ending in XNU boots + PMRD panic) | B2 evidence-map + B5 attempt-runner + S1 stamp-decoder lanes. The attempt pattern — preconditions abort, never wait; decode stamps FIRST; one-line verdicts — is the transferable art |
-| [`evidence-channels/`](evidence-channels/) | Instruction-level ABL/SoC truth: `ABL-USB-STATE.md` (what the fastboot handoff does/doesn't tear down), `ABL-MBA-PROTOCOL.md` (the LPCM mailbox wire: mbox[2] 0x05250000 qid 0x12, doorbell/GO/in-place reply), `ABL-LPCM-REQUEST.md` (the 0xf8 refusal decoded + the corrected request frame: cmd 0x02 dual-id table, success = reply dword1 == 0), `ABL-RUNTIME-FACTS.md` (device abl.log facts), `DISPLAY-PRODUCER.md` (CDPHY dies 41 ms pre-jump; 128-byte handoff + revive ladder), **`PAYLOAD-ADMISSION.md` (the v39–v51 campaign: embedded envelope, payload validation, window selection vs the stock FDT reservation map, LB_STEP/LB_FAIL instrumentation, the v51 XNU-boot record)** | A-ABL/A-ABL2/A-ABL3/C3 lanes + the coordinator's admission fixes, 2026-10-27. Host-only capstone teardown of the live stock ABL (`deepspace-17.4-16433848`) + DT decompile + saved captures |
+| [`evidence-lab/`](evidence-lab/) | The reproducible experiment pattern: `EVIDENCE-MAP.md` (channel×offset×decoder table + per-outcome command blocks), `decode-shim-stamps.py` (TSHIMST1/2 trail decoder, selftest included), `run-attempt.sh` (ONE command per device attempt: arm → boot → watch → park → collect → decode → one-line verdict), `ADT-NODES.md` (what the ADT emits now: `/options` + G2 nodes), `INIT-ASSERTION.md` (the v51/1695 wall — retired), **`INIT-NVRAM.md` (the v54 NVRAM wall dissected to file:line — `IONVRAM.cpp:1380` explicit panic, image-content-only backend selection, no boot-arg escape — plus the exact 4-prop `/chosen` fix v55 ships)**, `ATTEMPTS.md` (the attempt ledger: 2026-10-26/27 backfill, v36–v38, the **v39–v51 EP0-determinism + payload-admission campaign** ending in XNU boots, the v53/v54 NVRAM-wall rows, and the **v55 STAGED-NOT-BOOTED row** — no device result claimed) | B2 evidence-map + B5 attempt-runner + S1 stamp-decoder + P1/P2/P6 init-wall lanes. The attempt pattern — preconditions abort, never wait; decode stamps FIRST; one-line verdicts — is the transferable art |
+| [`evidence-channels/`](evidence-channels/) | Instruction-level ABL/SoC truth: `ABL-USB-STATE.md` (what the fastboot handoff does/doesn't tear down), `ABL-MBA-PROTOCOL.md` (the LPCM mailbox wire: mbox[2] 0x05250000 qid 0x12, doorbell/GO/in-place reply), `ABL-LPCM-REQUEST.md` (the 0xf8 refusal decoded + the corrected request frame: cmd 0x02 dual-id table, success = reply dword1 == 0), `ABL-RUNTIME-FACTS.md` (device abl.log facts), `DISPLAY-PRODUCER.md` (CDPHY dies 41 ms pre-jump; 128-byte handoff + revive ladder), **`PAYLOAD-ADMISSION.md` (the v39–v51 campaign: embedded envelope, payload validation, window selection vs the stock FDT reservation map, LB_STEP/LB_FAIL instrumentation, the v51 XNU-boot record)**, **`ROOT-INTEGRATION.md` (root-v7 opt-in on `build-next-boot.sh`: `WITH_ROOT7=1` + ADT window `0x0A400000`, the 64 MiB headroom gate it clears, boot-args contract, device-validation caveats)** | A-ABL/A-ABL2/A-ABL3/C3 lanes + the coordinator's admission fixes, 2026-10-27; ROOT-INTEGRATION from the P3 root lane. Host-only capstone teardown of the live stock ABL (`deepspace-17.4-16433848`) + DT decompile + saved captures |
 | [`EVIDENCE-CHANNELS.md`](EVIDENCE-CHANNELS.md) | The measured pmsg (PA `0x95400000`) collision map and the operating rules it forces | R5 evidence-channel relocation lane, from today's on-device dumps |
 
 ## Verify a fresh clone in one minute

@@ -173,6 +173,16 @@ rows before the dumps were read, and those rows are upgraded in place below.
   in INIT-ASSERTION.md is retired as the live wall; the new NVRAM wall
   analysis lands in INIT-NVRAM.md (P1, folded when written).
 
+### Backfill — 2026-10-27 12:19 v55 STAGED-NOT-BOOTED (host-only ledger note)
+
+- **v55 (2026-10-27 12:19) — STAGED-NOT-BOOTED, no device contact, NO device
+  result claimed.** v55 (NVRAM CHRP fix, sha `00c23ba634495784…`) is built +
+  AVB-verified + QEMU-validated past the NVRAM wall, but the 12:19 device
+  attempt never ran: the phone was absent at preflight and the runner aborted
+  safely pre-boot — no blind boot, no device writes, no dump. v55 fires
+  on-device the moment the phone reconnects (coordinator-owned); nothing in
+  this row should be read as an on-device outcome.
+
 ## Attempt log — one line per attempt (appended by run-attempt.sh)
 
 timestamp | candidate sha | attempt name | EP0? | last-stage | reason | dump path
@@ -203,6 +213,7 @@ timestamp | candidate sha | attempt name | EP0? | last-stage | reason | dump pat
 2026-10-27T11:32:15 | 50e7becec35e1af9 | v53-g2 | yes | PANIC(12)@seq1935762554 | xnu-panicked-xnu-entered | attempts/20261027-113136-v53-g2/reader-full.txt
 2026-10-27T11:35:26 | 50e7becec35e1af9 | v53 | no | no-device | aborted-preflight-waiting | -
 2026-10-27T11:44:38 | c6adcec3efe1ea8e | v54 | yes | PANIC(12)@seq1935762558 | nvram-chrp-handler-failed | attempts/20261027-114400-v54/reader-full.txt
+2026-10-27T12:19:00 | 00c23ba634495784 | v55 | no | staged-not-booted | aborted-preflight-phone-absent | -
 
 ## 20261027-112204 (cron device-loop)
 [run-attempt] outcome=ep0-live EP0=yes
