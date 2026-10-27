@@ -140,81 +140,40 @@ read-ramdump.py against the surviving dumps (outputs reproduced exactly).
   missing layer is MBA-syscon (0x5250000) bring-up / ABL MBA quiesce — NOT the
   LPCM payload (wire audit already agrees with CPM-FIRST-SPEC §3.1 + DT).
 
-## v39–v51 — the EP0-determinism + payload-admission campaign (2026-10-27 09:45–10:40)
+### Backfill — 2026-10-27 11:31–11:52 v53-g2 → v54 (P6, host-only ledger backfill)
 
-These thirteen attempts took the lane from "EP0 enumerated once" to "XNU
-boots on the phone". The script's outcome class for all of them is
-`ep0-live` (the console stayed up, so no park happened during the watch
-window), which is why the table rows look uniform — the real verdicts below
-come from the dumps, which were pulled **late** (after the shim's terminal
-reset or XNU's own panic reset parked the phone) and decoded afterwards
-(`late-kernel.log` + regenerated `stamps-decode.txt`; the v51 dir carries
-`reader-full.txt`). Full analysis: [`../evidence-channels/PAYLOAD-ADMISSION.md`](../evidence-channels/PAYLOAD-ADMISSION.md).
+Verdicts assembled host-side from each attempt dir's `meta.txt` +
+`reader-full.txt`; run-attempt.sh had auto-appended preliminary `ep0-live`
+rows before the dumps were read, and those rows are upgraded in place below.
 
-- **v39 (09:45, sha `6fee0c6f47f0dab5`)** — **EP0 first full enumeration +
-  first transfer-active refusal.** Warm world: `usb-warm DONE 0x33313130`
-  (GSNPSID), preflight PASS, `dma-admit DONE`, `ep0-ready DONE 0x820009`,
-  8 s enumeration wait DONE (console live), then `payload-admit ENTER
-  0x8a000000` and the handoff-time check refused — the old
-  `state != EP0_SETUP` predicate treats the host-connected endpoint (parked
-  in a wait-status) as busy. The refusal path re-entered the USB wait and
-  died at `usb-enum-wait FAULT 0x0` (seq 33).
-- **v40–v44 (09:51–10:08, shas `2c6822462e7fc090`, `732838a6f184402a`,
-  `65d450fc7cca1d27`, `c91aec537d612442`, `ceb6ea419363be3d`)** — **EP0
-  stamps + wait/WDT forensics.** Per-request EP0 breadcrumbs land
-  (`usb-enum-wait ENTER type<<16|req<<8|len` / `DONE 0x8000|n`): the dumps
-  show the host polling loop as `0xc05a00 ENTER → 0x8180 DONE` pairs (384 B
-  GET_LOG reads). Every attempt still died `FAULT 0x0` **exactly ~9.0 s
-  after the last `wdt-pat`** (e.g. pat@4.4 s → FAULT@13.4 s): the survey
-  finds THREE firmware WDTs but the pat path services two — the unpatted
-  instance bites mid-wait. v44's dump additionally proves the endpoint
-  parks in `WAIT_STATUS3` after the host's last read — the transfer-active
-  predicate, not the USB link, was refusing every handoff.
-- **v45 (10:12, sha `bbbd734f39501ff2`)** — predicate fixed (only a data
-  stage in flight blocks) and the first payload admission attempt: the
-  initrd scan refused `no TEGUXNU payload within scan budget` (stamped
-  `no TEGUX`, seq 75 @29.1 s) — ABL's retained vendor archives push the
-  TEGUXNU magic past the 64 MiB scan budget. Drove the embedded-envelope
-  delivery.
-- **v46/v46b (10:18/10:19, aborted builds — no table rows)** — first
-  envelope build embedded the payload AND still shipped it as the ramdisk:
-  84,480,000 B > the 67,108,864 B AVB partition, so AVB refused pre-boot.
-  v46b switched to the empty cpio (tegu `ramdisk_size = 0` semantics) →
-  42,889,216 B, boots.
-- **v46b boot (10:21, sha `7f8394e35098c28d`)** — envelope found and
-  validated (`payload-admit DONE 0x3/0x4`), window `0x88000000+160M`
-  refused `XNU window overlaps FDT reservation` (stamped `XNU wind`).
-- **v47 (10:27, sha `da10ae8fcfc85291`)** — window experiment
-  `0x97400000+128M` refused `invalid kernel window` (stamped `invalid `):
-  base not 32 MiB-aligned — the alignment gate working as designed.
-- **v48 (10:30, sha `38934b4945b15c18`)** — `0x98000000+112M` refused
-  `insufficient kernel headroom` (stamped `insuffic`): the payload needs
-  92.1 MiB of kernel + 64 MiB headroom = 156.1 MiB minimum.
-- **v49 (10:33, sha `78d3f8d5a6d0da1e`) and v50 (10:37, sha
-  `a80478a83f984ffa`)** — `FDT dynamic pool unresolved` refusals (stamped
-  `FDT dyna`) on `0xA8000000+256M` and then the correct window
-  `0xD0000000+160M`: the stock FDT carries `shared-dma-pool` nodes with no
-  `alloc` property (pkvm_iommu_cma, vframe 532 MiB reusable, vstream) that
-  the old check treated as fixed reservations — refusing EVERY window.
-- **v51 (10:40, sha `9aa84e828405f90a`)** — unresolved pools non-fatal →
-  **ADMISSION PASS on `0xD0000000+0x0A000000`** → segments copied →
-  EL2→EL1 drop → **XNU booted**: VM bootstrap, IOKit, vnguard/AMFI/Sandbox
-  policies, PMRD power ladder, then `%s:%d Assertion failed: %s` panic and
-  `MACH Reboot` (~103 s console time). Mirror v2 (seq 6, 7,642 B) +
-  breadcrumbs `XNU_ENTRY(6) → XNU_INIT(7) → PANIC(12)` + 90 KB console
-  captured via the late pull. **Current blocker = the init assertion after
-  PMRD**; note the stamp page itself is consumed on a successful run (XNU
-  owns the pmsg zone after the jump) — "no TSHIMST magic" on a post-XNU
-  dump is the success signature, not channel loss.
+- **v53-g2 (2026-10-27 11:31:36)** — ADT with G2 nodes (sha
+  `50e7becec35e1af9…`). EP0 console live; **XNU entered** and ran the PE/IOKit
+  init ladder — `found interrupt-controller` + `found timer`, VM bootstrap,
+  ATM/Firehose/OSLog, scheduler clutch, mig_table, serial KDP, `iBoot version:
+  laguna-shim`, vnguard/AMFI/Sandbox policies — then panicked after PMRD's
+  ON_STATE power event with the undecoded-format assertion record (`panic
+  message: %s:%d Assertion failed: %s`, second record `panic`, frames=0) →
+  `MACH Reboot`. Reader verdict: `PANICKED | stage=PANIC(12) | XNU
+  entered=yes`.
+- **v53 (11:31:57) + v53 (11:35:26) — aborted, no device.** Same v53-g2
+  image; preflight `getvar product` never saw a responsive fastboot
+  (`< waiting for any device >`) because the phone was still inside the
+  v53-g2 boot/panic cycle. The precondition abort worked as designed: no
+  blind boot, no device writes, no dump.
+- **v54 (2026-10-27 11:44:00)** — ADT with `/options` + G2 nodes (sha
+  `c6adcec3efe1ea8e…`). **PASSED `IOPlatformExpert.cpp:1695`** — no more
+  `gIOOptionsEntry` assert; `pe_arm_map_interrupt_controller: found
+  interrupt-controller` + `found timer` on device, then the full ladder to
+  `iBoot version: laguna-shim`. **NEW WALL:** `panic message:
+  IONVRAMCHRPHandler creation failed` — `IONVRAM.cpp:getNVRAMProperties:1151
+  - Unable to find nvram-bank-size property` →
+  `IONVRAMCHRPHandler.cpp:init:304 - Unable to get NVRAM properties` →
+  `MACH Reboot` (auto-parked back in fastboot). Dump read 11:52; reader
+  verdict `PANICKED | stage=PANIC(12) | XNU entered=yes`. The 1695 analysis
+  in INIT-ASSERTION.md is retired as the live wall; the new NVRAM wall
+  analysis lands in INIT-NVRAM.md (P1, folded when written).
 
 ## Attempt log — one line per attempt (appended by run-attempt.sh)
-
-(For v39+ the script recorded the `ep0-live` outcome class — the console
-stayed up through the watch window, so no park happened while it was
-watching. The dumps were pulled late and decoded afterwards; the decoded
-per-attempt verdicts live in the v39–v51 prose section above, and the
-attempt dirs' `stamps-decode.txt` files were regenerated 2026-10-27 from
-the surviving `late-kernel.log` apertures.)
 
 timestamp | candidate sha | attempt name | EP0? | last-stage | reason | dump path
 2026-10-26T18:37:00 | 988561750fc9307e | v2 | no | usb-dead(no-stamps) | usb-dark | -
@@ -238,3 +197,17 @@ timestamp | candidate sha | attempt name | EP0? | last-stage | reason | dump pat
 2026-10-27T10:33:44 | 78d3f8d5a6d0da1e | v49 | yes | ep0-live | usb-console-live | -
 2026-10-27T10:37:36 | a80478a83f984ffa | v50 | yes | ep0-live | usb-console-live | -
 2026-10-27T10:40:03 | 9aa84e828405f90a | v51 | yes | ep0-live | usb-console-live | -
+2026-10-27T11:07:46 | 16360033d2b9d2a3 | v52 | yes | ep0-live | usb-console-live | -
+2026-10-27T11:22:46 | 8ced00652596ca94 | loop-20261027-112204 | yes | ep0-live | usb-console-live | -
+2026-10-27T11:31:57 | 50e7becec35e1af9 | v53 | no | no-device | aborted-preflight-waiting | -
+2026-10-27T11:32:15 | 50e7becec35e1af9 | v53-g2 | yes | PANIC(12)@seq1935762554 | xnu-panicked-xnu-entered | attempts/20261027-113136-v53-g2/reader-full.txt
+2026-10-27T11:35:26 | 50e7becec35e1af9 | v53 | no | no-device | aborted-preflight-waiting | -
+2026-10-27T11:44:38 | c6adcec3efe1ea8e | v54 | yes | PANIC(12)@seq1935762558 | nvram-chrp-handler-failed | attempts/20261027-114400-v54/reader-full.txt
+
+## 20261027-112204 (cron device-loop)
+[run-attempt] outcome=ep0-live EP0=yes
+[run-attempt] VERDICT: 2026-10-27T11:22:46 | 8ced00652596ca94 | loop-20261027-112204 | yes | ep0-live | usb-console-live | -
+[run-attempt] appended to /Users/andersmadsen/Developer/personal/hackios/research/laguna-usb-fix/ATTEMPTS.md
+[run-attempt] evidence: /Users/andersmadsen/Developer/personal/hackios/research/laguna-usb-fix/attempts/20261027-112208-loop-20261027-112204
+[run-attempt] DONE — force-fastboot remains ARMED (disarm is a coordinator decision).
+

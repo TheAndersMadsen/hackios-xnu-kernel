@@ -1,20 +1,20 @@
 # Porting kit — death instrumentation for the laguna bring-up
 
-> **STATUS (2026-10-27, attempt v51): XNU BOOTS ON THE PHONE.** `fastboot
-> boot` of the embedded-envelope candidate (window `0xd0000000+0x0A000000`)
-> passed payload admission, dropped EL2→EL1, and ran native XNU through VM
-> bootstrap, IOKit, the vnguard/AMFI/Sandbox security policies, and PMRD's
-> power-state ladder — then panicked on an init assertion right after PMRD
-> (`"%s:%d Assertion failed: %s"`, `MACH Reboot`). That assertion is the
-> current blocker. The panic is fully captured (XNU-MSGBUF **v2** mirror
-> seq 6, breadcrumbs `XNU_ENTRY(6)→XNU_INIT(7)→PANIC(12)`, 90 KB console —
-> reader verdict `PANICKED | XNU entered=yes`). Enablers proven on device:
-> deterministic EP0 console (v39+), the stamped attempt loop
-> (force-fastboot → boot → stamp → park → collect → decode), mirror v2,
-> and the tegu-proven entry contract (embedded TEGUPLD1 envelope +
-> `image_size` raise + EL2→EL1 drop). See
-> [`evidence-channels/PAYLOAD-ADMISSION.md`](evidence-channels/PAYLOAD-ADMISSION.md)
-> and the v39–v51 section of
+> **STATUS (2026-10-27, attempt v54): XNU PASSES PE INIT — NEW WALL = NVRAM.**
+> Latest milestone: v54 (ADT with `/options` + G2 nodes) **PASSED
+> `IOPlatformExpert.cpp:1695`** — the v51 `gIOOptionsEntry` assert is retired —
+> with on-device proof `pe_arm_map_interrupt_controller: found
+> interrupt-controller` + `found timer`, then the full ladder (VM bootstrap,
+> ATM/Firehose/OSLog, scheduler clutch, serial KDP, `iBoot version:
+> laguna-shim`). **Current blocker: `IONVRAMCHRPHandler creation failed`** —
+> `IONVRAM.cpp:getNVRAMProperties:1151` can't find `nvram-bank-size`, so the
+> ADT needs `nvram-bank-size` + NVRAM properties (and whatever
+> `IONVRAMCHRPHandler::init` reads next) → `MACH Reboot`, auto-parked in
+> fastboot. Fully captured (mirror v2 breadcrumbs `XNU_ENTRY(6)→XNU_INIT(7)→
+> PANIC(12)`, reader verdict `PANICKED | XNU entered=yes`). See
+> [`evidence-lab/INIT-ASSERTION.md`](evidence-lab/INIT-ASSERTION.md) (1695
+> wall, retired), [`evidence-lab/ADT-NODES.md`](evidence-lab/ADT-NODES.md)
+> (what the ADT now emits), and the v53/v54 rows of
 > [`evidence-lab/ATTEMPTS.md`](evidence-lab/ATTEMPTS.md).
 
 Everything in this directory is folded from today's validated research lanes so
