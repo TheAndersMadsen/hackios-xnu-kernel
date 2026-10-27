@@ -183,6 +183,130 @@ rows before the dumps were read, and those rows are upgraded in place below.
   on-device the moment the phone reconnects (coordinator-owned); nothing in
   this row should be read as an on-device outcome.
 
+### Backfill — 2026-10-27 13:51–15:09 v55 → v59 (K7, host-only ledger backfill)
+
+Verdicts assembled host-side from each attempt dir's `meta.txt` +
+`reader-full.txt`; run-attempt.sh had auto-appended preliminary `ep0-live`
+rows before the dumps were read, and those rows are upgraded in place below.
+This block extends (does not duplicate) the P6/Q6 v53/v54 backfill above.
+
+- **v55 (2026-10-27 13:51:13, sha `00c23ba634495784…`, mach r4r5-tcm
+  `b39179b5…`) — FIRST ROOT-MOUNT SUCCESS + the errno-8 wall appears.**
+  The v55 CHRP NVRAM ADT passed on device: `NVRAM size is 8192 bytes`
+  (IONVRAM.cpp:initImageFormat:1364), `_bankSize=0x2000, _bankCount=0x1,
+  _currentBank=0` (getNVRAMProperties:1176), unserializeImage ok — the v54
+  `IONVRAMCHRPHandler creation failed` panic is GONE. Reader MILESTONES:
+  reached 8 rungs XNU-ENTRY → PE-INTCTRL → PE-TIMER → VM-BOOTSTRAP-DONE →
+  **NVRAM-OK** → PE-1695-PASSED → **CPU-REG** → **ROOT-MOUNT**
+  (`BSD root: md0`, `vfs_mountroot ok`), last=ROOT-MOUNT,
+  next-expected=LAUNCHD-EXEC, wall=UNKNOWN-PANIC. Console then:
+  `load_init_program: attempting to load /sbin/launchd` @42.601 s →
+  `failed loading /sbin/launchd: errno 8` @42.620 s → `MACH Reboot`
+  @44.118 s. PANIC(12)@seq1935762565; panic channel message=None (no panic
+  string recovered — the launchd-exec panic prints only via the init_programs
+  loop's final `panic("Process 1 exec of %s failed, errno %d")`, which this
+  boot's capture did not recover as text). Compact stages record
+  LAUNCHD_EXEC(9) = the attempt, not a success.
+- **v56 (13:55:08, sha `255d40afb6c5fc59…`) — root-v7 + DRAM window
+  0x0A400000: window EXONERATED, wall reproduced.** v55 ADT with dram-size
+  bumped 0x0A000000→0x0A400000 + WITH_ROOT7=1 (window needed for the larger
+  payload). Identical ladder to ROOT-MOUNT, identical death:
+  errno 8 @108.315 s, PANIC(12)@seq1935762572, no panic string. The +4 MiB
+  window is not the problem; the wall is downstream of root-mount.
+- **v57 (13:59:21, sha `96db88f3a1757aa8…`) — root-v8 (libdispatch
+  restored): same wall.** Q5's root-v8 (`77dc3e9f…`, split libdispatch
+  dylib restored per USERLAND-READY M3). Ladder + death identical:
+  console `failed loading /sbin/launchd: errno 8` @105.448 s,
+  PANIC(12)@seq1935762579. Root-v7 vs root-v8 makes no difference → root
+  CONTENT exonerated; every root generation dies at the same exec.
+- **v58 (14:10:20, sha `8cdc6dd8e1243428…`) — systrace armed, SILENT
+  decline.** Boot-args gained `systrace=1` (the kern_exec.c TUNABLE,
+  kern_exec.c:1165-1166). Zero trace output: the TUNABLE declares the
+  variable but nothing in the booted mach (still r4r5-tcm, pre-execdiag)
+  reads it at the decline site → the `exec_mach_imgact` magic gate returns
+  a silent `-1` and the activator loop collapses to ENOEXEC with no print.
+  errno 8 @566.598 s, PANIC(12)@seq1935762586. Motivated K1's unconditional
+  execdiag instrument (v59).
+- **v59 (15:09:08, sha `51f3d78d71f403fc…`, mach r4r6-execdiag
+  `34b300e0…`, WITH_ROOT8=1) — MOCKFS-STEAL FINGERPRINT CONFIRMED.**
+  execdiag fired at the wall (3413.242 s):
+  `execdiag: /sbin/launchd: declined: first page is not a Mach-O image:
+  err=-1 hdr[magic=0x00000000 cputype=0x00000000 cpusub=0x00000000
+  filetype=0x00000000] fsize=29360128 vdata[0..15]= 00000000 00000000
+  00000000 00000000` then `execdiag: /sbin/launchd: ENOEXEC: no execsw
+  image activator accepted this file: err=8 …`. Read: the exec read a
+  28 MiB "file" (fsize 29360128 = 0x1C00000 = the WHOLE root-v8 HFS+
+  volume, not launchd's 541,600 B) whose first page is zeros — mockfs
+  claimed the HFS+-formatted md0 as root (its mountroot accepted ANY
+  device; no `mockfs_check_macho` gate in this binary) and served the raw
+  volume as one synthetic `/sbin/launchd`; first page zeros (HFS+ reserved
+  boot block, volume header at offset 1024) → magic gate declines silent
+  -1 → ENOEXEC(8) → panic. K2/K3's diagnosis is device-proven exactly as
+  predicted (BRIDGE-EXEC-DIFF.md §verdict). Full analysis:
+  ENOEXEC-ROOT-MOUNT.md. Fix = K3 patches 0001+0002 (applied to the
+  foundation tree; build green is K4's lane, mach.blazer-r4r7-hfs).
+
+### Backfill — 2026-10-27 16:10–17:34 v60 → v61 (F4, host-only ledger backfill)
+
+Verdicts assembled host-side from each attempt dir's `meta.txt` +
+`reader-full.txt` + `late-kernel.log`; run-attempt.sh had auto-appended
+preliminary `ep0-live` rows before the dumps were read, and those rows are
+upgraded in place below. This block extends (does not duplicate) the K7
+v55→v59 backfill above. Both attempts boot the SAME mach
+`mach.blazer-r4r7-hfs` (`27f05924…` = K3 mockfs-gate + laguna_hfs port +
+K4 build fixes) — the delta between v60 and v61 is root content only
+(v8 → v9), so the wall that moved is a pure root-image result.
+
+- **v60 (2026-10-27 16:10:53, sha `f207a5e087f6c9ee…`, mach r4r7-hfs
+  `27f05924…`, root-v8 `77dc3e9f…`, WITH_ROOT8=1) — HFS ROOT MOUNT +
+  LAUNCHD EXEC'D + DYLD SHARED REGION: the ENOEXEC wall is GONE.**
+  laguna_hfs won the root race against mockfs exactly as K4 verified in
+  source: `BSD root: md0, major 1, minor 0` → `hfs: mounted iOSRoot on
+  device b(1, 0)` @908.386 s → `load_init_program: attempting to load
+  /sbin/launchd` with NO execdiag decline and NO errno 8 — launchd
+  **exec'd** (first real exec past the v55–v59 wall) and dyld ran inside
+  PID 1: `shared_region_check_np(…) = 12`,
+  `minisandbox: request 2 (first seen from launchd[1]): allowed`, dyld
+  probed its cache paths (`/System/Library/Caches/com.apple.dyld/` = 2
+  ENOENT; `dyld_shared_cache_arm64.development` / `dyld_shared_cache_arm64`
+  = 9). Reader MILESTONES: all 10 rungs reached — XNU-ENTRY, PE-INTCTRL,
+  PE-TIMER, VM-BOOTSTRAP-DONE, NVRAM-OK, PE-1695-PASSED, CPU-REG,
+  ROOT-MOUNT, LAUNCHD-EXEC, DYLD — last=DYLD, next-expected=none
+  (dyld=shared-region). **NEW WALL (dyld bind, N1r's predicted one):**
+  `pid 1 exited -- exit reason namespace 6 subcode 0x4, description
+  Symbol not found: _NDR_record` + `Expected in:
+  <616FA041-BFAA-389C-8C6A-3DC585DAD933> /usr/lib/libSystem.B.dylib`
+  @908.504 s — launchd's bind #1 against the closure's EMPTY
+  `LC_DYLD_EXPORTS_TRIE` placeholders (NDR-RECORD-FIX.md §1.1). coredump
+  also failed: `/private/var/cores` missing (error 2) — a real path
+  gap, not just noise. Panic `initproc failed to start -- exit reason
+  namespace 6 subcode 0x4` → `MACH Reboot` @910.163 s;
+  PANIC(12)@seq1935762603.
+- **v61 (17:33:49, sha `22a0ae61355ea622…`, same mach + root-v9
+  `a427241d…` = N1r's export-trie + __TEXT closure repair) —
+  _NDR_RECORD WALL CLEARED; NEW WALL = map_with_linking_np EINVAL(22) →
+  'indirect symbol has out of range address'.** `Symbol not found` /
+  `_NDR_record` appear NOWHERE in the boot: the namespace-6 subcode-0x4
+  bind wall is dead and N1r's repair is device-confirmed — launchd bound
+  past the entire 537-symbol census. Ladder identical (all 10 rungs,
+  dyld=shared-region; `hfs: mounted iOSRoot on device b(1, 0)` @44.137 s
+  — fresh boot session, so timestamps are ~20× earlier than v60). dyld's
+  console trail ran one step further than v60 — same shared-region/
+  minisandbox/cache-probe + libobjc-env lines, then:
+  `systrace: launchd[1] map_with_linking_np(0x16ed98780, 0x1, 0x16ed987b0,
+  0x1118) = 22` (EINVAL) @44.291 s → **NEW WALL:** `pid 1 exited -- exit
+  reason namespace 6 subcode 0x9, description indirect symbol has out of
+  range address` @44.296 s (dyld-1066's own fatal error text; launchd
+  never reached main — no `initproc exited`, no `kern.initproc_spawned`).
+  coredump failed again (`/private/var/cores` missing, error 2);
+  `MACH Reboot` @45.917 s; PANIC(12)@seq1935762613. Read (brief + N1r
+  provenance note): almost certainly the repaired dylibs' indirect symbol
+  table entries pointing out of segment range after the per-segment
+  export-trie remap — the residual family pre-documented in
+  NDR-RECORD-FIX.md §5 (disk-trie alias semantics / closure loading at
+  preferred addresses). Fix lane: F1 → root-v10 (INDIRECT-FIX.md when it
+  lands).
+
 ## Attempt log — one line per attempt (appended by run-attempt.sh)
 
 timestamp | candidate sha | attempt name | EP0? | last-stage | reason | dump path
@@ -222,8 +346,10 @@ timestamp | candidate sha | attempt name | EP0? | last-stage | reason | dump pat
 [run-attempt] evidence: /Users/andersmadsen/Developer/personal/hackios/research/laguna-usb-fix/attempts/20261027-112208-loop-20261027-112204
 [run-attempt] DONE — force-fastboot remains ARMED (disarm is a coordinator decision).
 
-2026-10-27T13:51:51 | 00c23ba634495784 | v55 | yes | ep0-live | usb-console-live | -
-2026-10-27T13:55:46 | 255d40afb6c5fc59 | v56 | yes | ep0-live | usb-console-live | -
-2026-10-27T13:59:59 | 96db88f3a1757aa8 | v57 | yes | ep0-live | usb-console-live | -
-2026-10-27T14:10:58 | 8cdc6dd8e1243428 | v58 | yes | ep0-live | usb-console-live | -
-2026-10-27T15:09:50 | 51f3d78d71f403fc | v59 | yes | ep0-live | usb-console-live | -
+2026-10-27T13:51:51 | 00c23ba634495784 | v55 | yes | ROOT-MOUNT→PANIC(12)@seq1935762565 | root-mounted-first-launchd-errno8-panic-stringless | attempts/20261027-135113-v55/reader-full.txt
+2026-10-27T13:55:46 | 255d40afb6c5fc59 | v56 | yes | ROOT-MOUNT→PANIC(12)@seq1935762572 | root-mounted-rootv7-window0x0A400000-errno8 | attempts/20261027-135508-v56/reader-full.txt
+2026-10-27T13:59:59 | 96db88f3a1757aa8 | v57 | yes | ROOT-MOUNT→PANIC(12)@seq1935762579 | root-mounted-rootv8-libdispatch-errno8 | attempts/20261027-135921-v57/reader-full.txt
+2026-10-27T14:10:58 | 8cdc6dd8e1243428 | v58 | yes | ROOT-MOUNT→PANIC(12)@seq1935762586 | systrace-armed-silent-decline-errno8 | attempts/20261027-141020-v58/reader-full.txt
+2026-10-27T15:09:50 | 51f3d78d71f403fc | v59 | yes | ROOT-MOUNT→PANIC(12)@seq1935762593 | execdiag-mockfs-steal-fingerprint-confirmed | attempts/20261027-150908-v59/reader-full.txt
+2026-10-27T16:11:43 | f207a5e087f6c9ee | v60 | yes | DYLD→PANIC(12)@seq1935762603 | hfs-root-mounted-launchd-exec-dyld-shared-region-ndr-record-bind-wall | attempts/20261027-161053-v60/reader-full.txt
+2026-10-27T17:34:27 | 22a0ae61355ea622 | v61 | yes | DYLD→PANIC(12)@seq1935762613 | ndr-cleared-map-with-linking-einval-indirect-symbol-out-of-range | attempts/20261027-173349-v61/reader-full.txt
