@@ -43,11 +43,11 @@ answer, the Mesa/GLI renderer path, the userland image build, and the
 | Area | State |
 | --- | --- |
 | XNU entry on the phone (kexec ladder) | ✅ Proven ×4 on real hardware (entry marker `0x5A5A5A5A`) |
-| Direct tegu-style shim → XNU | ✅ Reaches the kernel; watchdog + fault-screen console |
-| **Evidence channels (death instrumentation)** | ✅ Done — always-on XNU msgbuf mirror (XNU-MSGBUF v1, Mach `cae95ab12…`), USB EP0 console shim host-validated 306/306 (+ASan/UBSan), ramdump reader v2 57/57 — [`porting-kit/`](porting-kit/) |
+| Direct tegu-style shim → XNU | ✅ Reaches the kernel; watchdog + fault-screen console; EL2→EL1 drop at the final jump landed (v3.7 shim, register-for-register with the tegu sequence) |
+| **Evidence channels (death instrumentation)** | ✅ **Live** — TSHIMST2 shim stamps (pmsg+0x30000, nonce-matched provenance), XNU-MSGBUF v2 mirror + breadcrumbs, abl.log, pstore; proven end-to-end on real dumps. Kit now includes the evidence lab (attempt runner + ledger + decoders) and the ABL teardown docs — [`porting-kit/`](porting-kit/) |
 | **On-device delivery chain** | ✅ Proven on hardware — probe → 14 kexec segments → `kexec_load result=0` → XNU handoff magic `0x30484e58` at pmsg+`0x120` |
-| **Current blocker** | 🚧 XNU dies before `arm_vm_init` on laguna hardware — silently to every live console; the death is visible only through the post-mortem channels |
-| **Next instrument** | ⬜ Shim-direct USB-console boot — the polled EP0 gadget is the only channel that survives death (measured map: [`porting-kit/EVIDENCE-CHANNELS.md`](porting-kit/EVIDENCE-CHANNELS.md)) |
+| **Current frontier** | 🚧 USB-console shim cold path: the LPCM mailbox transport works (MBA magic `0x4d4241` confirmed, `mba-ack` completes) but the first clock-gate request came back **REFUSED `0xf8`** — firmware reply codes being decoded ([`porting-kit/evidence-channels/`](porting-kit/evidence-channels/)). Behind it, XNU still dies before `arm_vm_init` — visible only through the post-mortem channels |
+| **Stamped evidence loop** | ✅ Proven 4/4 on device — force-fastboot auto-park (persistent devinfo env) + TSHIMST2 trail + immediate ramdump: every shim death decodes to a named stage with the hardware's values attached; EP0 enumerated live once (2026-10-27) |
 | **Stock iOS lock screen renders (blazer kernel, QEMU)** | ✅ Composited, updating lock screen; zero panics; SpringBoard up in 26.75 s |
 | launchd + root mount in QEMU | ✅ APFS and HFS roots, full daemon set (173 daemons spawned) |
 | backboardd → scanout in QEMU | ✅ Display pipeline works end-to-end |
@@ -139,7 +139,8 @@ appended last so `rdinit=/xni` wins. Do not “fix” this by touching `init_boo
 
 | Task | What it needs |
 | --- | --- |
-| **Cold UFS/DPU production (the big one)** | A display-owning **Linux first stage** that brings up Google's UFS/PHY/CPM cold, programs a dedicated linear scanout, preserves it across kexec and emits the validated 128-byte handoff. That single piece unlocks the first on-device render. The exact CPM frames, gates and record contract are in [`docs/RENDER.md`](docs/RENDER.md) §2–§6. Hard lesson: DC9x00 readback on real silicon is an **async SError → DER Event 20 crash reset** (`0xc00e`), even though it is harmless in QEMU — keep every probe/readback off. |
+| **Decode the LPCM reply codes (current frontier)** | The shim's LPCM mailbox requests complete but the first USB clock-gate came back status `0xf8` (and the response word carries `0x8400000fffffff8`). Map the firmware reply/status bytes to meanings — ABL's own callers are the reference ([`porting-kit/evidence-channels/ABL-MBA-PROTOCOL.md`](porting-kit/evidence-channels/ABL-MBA-PROTOCOL.md)); every refusal is stamped with raw values in the park dumps. |
+| **Cold UFS/DPU production (the big one)** | A display-owning **Linux first stage** that brings up Google's UFS/PHY/CPM cold, programs a dedicated linear scanout, preserves it across kexec and emits the validated 128-byte handoff. That single piece unlocks the first on-device render. The exact CPM frames, gates and record contract are in [`docs/RENDER.md`](docs/RENDER.md) §2–§6; the CDPHY power-off discovery and the revive ladder are in [`porting-kit/evidence-channels/DISPLAY-PRODUCER.md`](porting-kit/evidence-channels/DISPLAY-PRODUCER.md). Hard lesson: DC9x00 readback on real silicon is an **async SError → DER Event 20 crash reset** (`0xc00e`), even though it is harmless in QEMU — keep every probe/readback off. |
 | **Touch (TCM)** | The host-tested driver exists (198/198). Needs on-device AOC pad-slot layout, TBN bus-parked check, CPM hard reset/rails, TCM generation detect, SSI clock liveness. |
 | **UFS / root transport** | A normal userdata file (adb push) that the ladder's Linux stage ro-mounts (F2FS) and kexec-segments as `md0`. Cache files must be **uid 0**; there must be no `/usr/lib/system/libdispatch.dylib` on disk (the built image already satisfies both — see `docs/BUILD.md`). |
 | **GL flag chain** | A `GL=1 REST=1` userland build exercised with the softpipe boot-args on the platform image (`docs/RENDER.md` §8–§9). Never `gpu=1` — that is the Qualcomm Adreno driver. |
@@ -157,7 +158,7 @@ appended last so `rdinit=/xni` wins. Do not “fix” this by touching `init_boo
 | [`fdt/`](fdt/) | the phone's device tree |
 | [`files/`](files/) | laguna driver sources (mailbox first) |
 | [`tools/`](tools/) | device-tree and log tools, plus [`tools/dslocal/`](tools/dslocal/README.md) — the identity-record staging kit any port can reuse |
-| [`porting-kit/`](porting-kit/) | the folded death-instrumentation kit — msgbuf-mirror patch + format contract, standalone ramdump reader, USB EP0 console runbooks, and the measured pmsg evidence-channel map |
+| [`porting-kit/`](porting-kit/) | the folded death-instrumentation kit — msgbuf-mirror patch + format contract, standalone ramdump reader, USB EP0 console runbooks + builder (v3.7 flow), the evidence lab (attempt runner, ledger, decoders), the ABL/MBA/CDPHY teardown docs, and the measured pmsg evidence-channel map |
 | [`docs/PORTING.md`](docs/PORTING.md) | the full porting checklist and current wall map |
 | [`docs/BUILD.md`](docs/BUILD.md) | clean kernel build, marker and host-validation recipe |
 | [`docs/BOOT-CONTRACT.md`](docs/BOOT-CONTRACT.md) | kexec/direct entry, ADT, boot-args and RAMDisk→md0 |

@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 # Host-only builder for a parent-approved temporary next boot. No device access.
+#
+# 2026-10-27 (shim v3.7 generation): the shim this builds now (a) warm-skips
+# the CPM phase when the fastboot handoff leaves DWC3 clocked (canary +
+# GSNPSID probed before any CPM work), (b) on the cold path talks to the LPCM
+# mailbox with ABL's instruction-verified transport (mbox[2] 0x05250000,
+# qid 0x12, page 0x05272000, doorbell/ctl/GO per ABL mba_send, in-place
+# reply, success = reply dword1 == 0), and (c) performs the EL2->EL1 drop at
+# the final jump (tegu_el_drop_and_jump, el-drop stamps as the last evidence).
+# The wire truth behind these constants is in ../evidence-channels/.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 LANE="$ROOT/research/laguna-usb-console"
@@ -27,8 +36,10 @@ from pathlib import Path
 import hashlib, sys
 macho, root = map(Path, sys.argv[1:])
 data = macho.read_bytes()
-if b"XNU-MSGBUF v1" not in data:
-    raise SystemExit("R4 Mach-O lacks XNU-MSGBUF v1; refusing a mirror-less next boot")
+# 2026-10-27: R5 relocated the evidence channels; the producer magic is now
+# XNU-MSGBUF v2 (header at pmsg+0x3F800). Accept v1 or v2 mirror-bearing machs.
+if b"XNU-MSGBUF v1" not in data and b"XNU-MSGBUF v2" not in data:
+    raise SystemExit("R4 Mach-O lacks XNU-MSGBUF v1/v2; refusing a mirror-less next boot")
 root_data = root.read_bytes()
 if len(root_data) != 25165824 or hashlib.sha256(root_data).hexdigest() != \
         "aebc9a8a410369b19c60c3e845cb814896bd9709264d2c085283cf816439b4bf":
