@@ -222,3 +222,8 @@ timestamp | candidate sha | attempt name | EP0? | last-stage | reason | dump pat
 [run-attempt] evidence: /Users/andersmadsen/Developer/personal/hackios/research/laguna-usb-fix/attempts/20261027-112208-loop-20261027-112204
 [run-attempt] DONE — force-fastboot remains ARMED (disarm is a coordinator decision).
 
+2026-10-27T13:51:51 | 00c23ba634495784 | v55 | yes | ep0-live | usb-console-live | -
+2026-10-27T13:55:46 | 255d40afb6c5fc59 | v56 | yes | ep0-live | usb-console-live | -
+2026-10-27T13:59:59 | 96db88f3a1757aa8 | v57 | yes | ep0-live | usb-console-live | -
+2026-10-27T14:10:58 | 8cdc6dd8e1243428 | v58 | yes | ep0-live | usb-console-live | -
+2026-10-27T15:09:50 | 51f3d78d71f403fc | v59 | yes | ep0-live | usb-console-live | -
