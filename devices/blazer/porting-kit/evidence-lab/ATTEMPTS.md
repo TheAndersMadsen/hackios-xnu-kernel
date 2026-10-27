@@ -150,3 +150,4 @@ timestamp | candidate sha | attempt name | EP0? | last-stage | reason | dump pat
 2026-10-27T07:47:00 | 200813d959f11897 | v34b | no | cpm-first[FAULT]@seq13 | cpm-never-came-up | research/session-20261027-usbboot/v34b-kernel.log
 2026-10-27T08:52:36 | 746902b9bb91ed89 | v36 | no | ep0-live | usb-console-live | -
 2026-10-27T08:58:48 | 3f2d200c1fbeb2d7 | v37 | no | usb-warm [FAULT]@seq27 | cpm-never-came-up | attempts/20261027-085704-v37/ramdump/kernel.log
+2026-10-27T09:18:18 | cb68de26ed49c2bc | v38 | no | wdt-quiesce-late [DONE]@seq34 | refused | attempts/20261027-091614-v38/ramdump/kernel.log

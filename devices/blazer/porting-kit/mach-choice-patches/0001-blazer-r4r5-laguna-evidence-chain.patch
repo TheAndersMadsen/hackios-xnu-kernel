@@ -1,0 +1,2163 @@
+From: "mach-choice lane (C1)" <fleet@localhost>
+Subject: [PATCH 1/2] blazer: the R4/R5 always-on evidence chain (0123..0130) ported onto the blazer tree
+
+Applies to the blazer integrated tree
+(research/laguna-foundation/kernel-blazer/xnu-src/xnu-8796.121.2, branch hakios).
+Ports the laguna-panic-capture lane's committed final state (kernel-wt @ 8d6d4b2:
+0123 panic capture + 0124 hardening + 0129 XNU-MSGBUF mirror v1 + 0130 collision-free
+window relocation) onto the platform-complete blazer mach.
+
+Adaptations vs the 141 patches (all in-file, commented):
+  1. laguna_panicdump.c body guard: #if defined(LAGUNA) -> #if defined(__arm64__) &&
+     !defined(LAGUNA_PANICDUMP_STUB) — the BCM2837 build defines no LAGUNA, so the
+     original guard silently compiles the stub path.
+  2. arming site: LagunaKeyStore::start (141) -> MiniAppleKeyStore::start (blazer's
+     first IOKit driver), extern "C" decl at file scope.
+  3. bsd hooks use __arm64__ instead of ARM64_BOARD_CONFIG_LAGUNA; arm_init anchors
+     are arm_vm_init / serialmode (no laguna_early/dc9x00 calls exist there).
+  4. start.s: PAN clear (.inst 0xd500409f) + bl EXT(laguna_logdump_entry) between
+     DAIFSet and "mov x20, x0" in start_first_cpu (foundation has no pre-VBAR store
+     of its own; the LGLW call needs x0 = boot_args PA).
+  5. pe_init.c check_for_panic_log: second fallback arm for lagunapanicdump
+     (default ON), reusing the existing blazer_panic_region .bss.
+The tree's own opt-in hakios.blazer_panicdump (default OFF) is untouched — exactly
+one default panic-capture writer. Boot args: lagunapanicdump=1/lagunalogdump=1 are
+the defaults; =0 disables either; lagunapanictest=<sec> forces a validation panic.
+
+Build proven on this host: make ... MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=DEVELOPMENT
+-j8 -k -> mach.development.bcm2837 sha256
+b39179b5d0268c9c98432c46bda0cfda66eacce299efb1baf79899c5342f465b (16,416,856 B).
+
+From: "mach-choice lane (C1)" <fleet@localhost>
+Subject: [PATCH 1/2] blazer: the R4/R5 always-on evidence chain (0123..0130) ported onto the blazer tree
+
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -25,6 +25,8 @@
+ osfmk/arm64/WKdmData.s		standard
+ osfmk/arm64/lz4_decode_arm64.s  standard
+ osfmk/arm64/lz4_encode_arm64.s  standard
++osfmk/arm64/laguna_panicdump.c	standard
++osfmk/arm64/laguna_entry_lastwords.s	standard
+ #osfmk/arm64/amcc_rorgn_ppl.c optional nos_arm_asm config_pmap_ppl
+ #osfmk/arm64/amcc_rorgn_common.c optional nos_arm_asm
+ osfmk/arm64/bcopy.s standard
+--- a/osfmk/arm64/Makefile
++++ b/osfmk/arm64/Makefile
+@@ -40,6 +40,8 @@
+ 	monotonic.h \
+ 	perfmon_arm64_regs.h \
+ 	proc_reg.h \
++	laguna_panicdump.h \
++	laguna_lastwords.h \
+ 	asm.h \
+ 	tlb.h \
+ 	pal_hibernate.h
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -77,6 +77,7 @@
+ #include <arm64/psci_smp.h>
+ #include <arm64/hakios.blazer_panicdump.h>
+ #include <arm64/hakios.blazer_display.h>
++#include <arm64/laguna_panicdump.h>
+ #endif
+ 
+ #include <console/serial_protos.h>
+@@ -542,6 +543,10 @@
+ 
+ 	arm_vm_init(xmaxmem, args);
+ 	loader_checkpoint(17);
++	/* R4 (laguna mirror port): the early I/O tables now exist, but serial_init
++	 * has not run. Map the shared ramoops aperture once and start the msgbuf
++	 * mirror (laguna_logdump_*; always-on unless lagunalogdump=0). */
++	laguna_logdump_early_init();
+ 
+ 	if (debug_boot_arg) {
+ 		patch_low_glo();
+@@ -567,6 +572,12 @@
+ 	/* Explicit blazer handoff only: map ramoops and arm the guarded capture.
+ 	 * With no boot-arg this is a no-op on every other board. */
+ 	hakios_blazer_panicdump_init();
++	/* R4/R5 laguna evidence chain (ported from laguna-panic-capture 0123..0130):
++	 * map the ramoops reserved-mem zone and arm the always-on panic capture +
++	 * msgbuf mirror stages (lagunapanicdump=1 default ON, lagunapanicdump=0
++	 * disables; lagunapanictest=<sec> forces a panic for validation). */
++	laguna_panicdump_init();
++	laguna_logdump_late_init();
+ 
+ 	serialmode = 0;
+ 	if (PE_parse_boot_argn("serial", &serialmode, sizeof(serialmode))) {
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -49,6 +49,7 @@
+ #include <kern/processor.h>
+ #include <kdp/kdp_core.h>
+ #include <arm64/hakios.blazer_panicdump.h>
++#include <arm64/laguna_panicdump.h>
+ #if ALTERNATE_DEBUGGER
+ #include <arm64/alternate_debugger.h>
+ #endif
+@@ -638,7 +639,16 @@
+ 	/* Capture the complete string + backtrace before kext/vnode/stackshot
+ 	 * sections. A later, longer rung supersedes the early string-only record. */
+ 	hakios_blazer_panicdump_capture(message, debug_buf_base,
++	    (vm_size_t)(debug_buf_ptr - debug_buf_base));
++#if defined(__arm64__)
++	/* R4 laguna chain rung 2 (ported, 0123/0124): the panic string AND the
++	 * panicked thread's backtrace frames are in the paniclog region now —
++	 * capture through the always-on Device-memory ramoops mapping (dsb on
++	 * every append, reset-safe immediately). The capture is idempotent per
++	 * boot and size-gated; later rungs supersede this fuller one. */
++	laguna_panicdump_capture(message, debug_buf_base,
+ 	    (vm_size_t)(debug_buf_ptr - debug_buf_base));
++#endif
+ 
+ 	paniclog_append_noflush("\n");
+ 	if (filesetKC) {
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -85,6 +85,7 @@
+ #include <sys/pgo.h>
+ #include <console/serial_protos.h>
+ #include <arm64/hakios.blazer_panicdump.h>
++#include <arm64/laguna_panicdump.h>
+ #include <IOKit/IOBSD.h>
+ 
+ #if !(MACH_KDP && CONFIG_KDP_INTERACTIVE_DEBUGGING)
+@@ -1168,6 +1169,11 @@
+ kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags)
+ {
+ 	loader_return();
++#if defined(__arm64__)
++	/* R4 laguna chain (ported, 0129): PEHaltRestart may reset without
++	 * returning through halt_all_cpus — flush the mirror ring here too. */
++	laguna_logdump_flush(LAGUNA_LOGDUMP_FLUSH_HALT);
++#endif
+ 	if ((type == kPEPanicRestartCPU) && (debugger_flags & DEBUGGER_OPTION_SKIP_PANICEND_CALLOUTS)) {
+ 		PEHaltRestart(kPEPanicRestartCPUNoCallouts);
+ 	} else {
+@@ -1287,7 +1293,15 @@
+ 		/* Early rung: preserve the panic string even if backtrace collection
+ 		 * aborts. The capture's nofault guards keep this path bounded. */
+ 		hakios_blazer_panicdump_capture(debugger_panic_str, debug_buf_base,
++		    (vm_size_t)(debug_buf_ptr - debug_buf_base));
++#if defined(__arm64__)
++		/* R4 laguna chain rung 1 (ported, 0123): the panic string is in the
++		 * paniclog region now. laguna_panicdump_capture is idempotent per
++		 * boot — a fuller rung re-captures over this one (size-gated); this
++		 * rung only stands if that rung never runs. */
++		laguna_panicdump_capture(debugger_panic_str, debug_buf_base,
+ 		    (vm_size_t)(debug_buf_ptr - debug_buf_base));
++#endif
+ 	}
+ #if defined(__x86_64__)
+ 	else if (((debugger_current_op == DBOP_DEBUGGER) && debugger_is_panic)) {
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -110,6 +110,27 @@
+ 			return;
+ 		}
+ 	}
++	{
++		/* R4 laguna chain (ported, 0123): lagunapanicdump defaults ON, and
++		 * the phone/kexec ADT has no iBoot pram node — without a region the
++		 * panic path wedges in SavePanicInfo before any paniclog text
++		 * exists (=0 disables; a real pram node always wins below). The
++		 * region is shared with the blazer fallback above (same 512 KiB
++		 * .bss, same purpose; the two capture paths are never armed
++		 * together). */
++		uint32_t laguna_fallback = 1;
++		DTEntry pram_entry;
++
++		(void)PE_parse_boot_argn("lagunapanicdump", &laguna_fallback,
++		    sizeof(laguna_fallback));
++		if (laguna_fallback != 0 &&
++		    kSuccess != SecureDTLookupEntry(0, "pram", &pram_entry)) {
++			gPanicBase = (vm_offset_t)blazer_panic_region;
++			gPanicSize = sizeof(blazer_panic_region);
++			panic_text_len = gPanicSize - sizeof(struct embedded_panic_header);
++			return;
++		}
++	}
+ #ifdef PLATFORM_PANIC_LOG_PADDR
+ 	gPanicBase = ml_io_map_wcomb(PLATFORM_PANIC_LOG_PADDR, PLATFORM_PANIC_LOG_SIZE);
+ 	panic_text_len = PLATFORM_PANIC_LOG_SIZE - sizeof(struct embedded_panic_header);
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -28,6 +28,7 @@
+ 
+ #include <arm64/machine_machdep.h>
+ #include <arm64/proc_reg.h>
++#include <arm64/laguna_panicdump.h>
+ #include <arm/machine_cpu.h>
+ #include <arm/cpu_internal.h>
+ #include <arm/cpuid.h>
+@@ -741,6 +742,11 @@
+ void
+ halt_all_cpus(boolean_t reboot)
+ {
++#if defined(__arm64__)
++	/* R4 laguna chain (ported, 0129): flush the msgbuf mirror ring before
++	 * the platform reset path runs. */
++	laguna_logdump_flush(LAGUNA_LOGDUMP_FLUSH_HALT);
++#endif
+ 	if (reboot) {
+ 		printf("MACH Reboot\n");
+ 		PEHaltRestart(kPERestartCPU);
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -642,6 +642,12 @@
+ 
+ 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
+ 
++// LAGUNA R4 (ported, 0129/EL2-ENTRY-DISCIPLINE): ABL hands off with unknown
++// PSTATE.PAN and no VBAR_EL1 yet. Clear PAN before the first MMU-off store,
++// then emit (or suppress via lagunalogdump=0) the physical LGLW XNU_ENTRY
++// record; x0 still holds the boot args PA as the call argument.
++.inst	0xd500409f						// msr PAN, #0
++	bl		EXT(laguna_logdump_entry)
+ 	mov		x20, x0
+ 	mov		x21, #0
+ 	LOADER_CHECKPOINT 1
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -114,6 +114,11 @@
+ #endif
+ 
+ #include <mach/vm_param.h>
++
++#if defined(__arm64__)
++#include <arm64/laguna_panicdump.h>
++#include <arm64/laguna_lastwords.h>
++#endif
+ 
+ #include <vm/vm_map.h>
+ #include <vm/vm_kern.h>
+@@ -909,6 +914,14 @@
+ 	lck_rw_lock_exclusive(&rootvnode_rw_lock);
+ 	set_rootvnode(init_rootvnode);
+ 	lck_rw_unlock_exclusive(&rootvnode_rw_lock);
++#if defined(__arm64__)
++	/* R4 (laguna mirror port, 0129): vfs_mountroot succeeded and the root
++	 * vnode is fully installed. */
++	(void)laguna_panicdump_stage(LW_STAGE_ROOT_MOUNTED,
++	    LW_PRODUCER_XNU_KERNEL, 0,
++	    (uint64_t)(uint32_t)rootdev, 0, 0, 0,
++	    "vfs_mountroot ok; root vnode installed");
++#endif
+ 	init_rootvnode = NULLVP;  /* use rootvnode after this point */
+ 
+ 
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -80,6 +80,11 @@
+  */
+ #include <machine/reg.h>
+ #include <machine/cpu_capabilities.h>
++
++#if defined(__arm64__)
++#include <arm64/laguna_panicdump.h>
++#include <arm64/laguna_lastwords.h>
++#endif
+ 
+ #include <sys/cdefs.h>
+ #include <sys/param.h>
+@@ -5133,6 +5138,16 @@
+ 	 */
+ 	error = exec_activate_image(imgp);
+ 	/* thread and task ref returned for vfexec case */
++#if defined(__arm64__)
++	if (!error && proc_pid(p) == 1) {
++		/* R4 (laguna mirror port, 0129): image activation succeeded; the
++		 * dynamic linker/user return is next. This deliberately does not
++		 * claim dyld has executed yet. */
++		(void)laguna_panicdump_stage(LW_STAGE_DYLD_STAGE,
++		    LW_PRODUCER_XNU_KERNEL, 0, 0, 0, 0, 0,
++		    "pid1 image active; dyld next");
++	}
++#endif
+ 
+ 	if (imgp->ip_new_thread != NULL) {
+ 		/*
+@@ -7053,6 +7068,11 @@
+ 	 */
+ 	set_security_token(p);
+ 
++#if defined(__arm64__)
++	/* R4 (laguna mirror port, 0129): the launchd path attempt. */
++	(void)laguna_panicdump_stage(LW_STAGE_LAUNCHD_EXEC,
++	    LW_PRODUCER_XNU_KERNEL, LW_FLAG_ATTEMPT, 0, 0, 0, 0, path);
++#endif
+ 	return execve(p, &init_exec_args, retval);
+ }
+ 
+--- a/bsd/kern/subr_log.c
++++ b/bsd/kern/subr_log.c
+@@ -79,6 +79,9 @@
+ #include <os/log_private.h>
+ #include <sys/ioctl.h>
+ #include <sys/msgbuf.h>
++#if defined(__arm64__)
++#include <arm64/laguna_panicdump.h>
++#endif
+ #include <sys/file_internal.h>
+ #include <sys/errno.h>
+ #include <sys/select.h>
+@@ -573,6 +576,14 @@
+ 	if (mbp->msg_bufx >= mbp->msg_size) {
+ 		mbp->msg_bufx = 0;
+ 	}
++#if defined(__arm64__)
++	/* R4 (laguna mirror port, 0129): only the kernel msgbuf, never ASL. The
++	 * existing log lock serializes the fixed mirror; no console duplicate is
++	 * introduced. */
++	if (mbp == msgbufp) {
++		laguna_logdump_putc(c, (uint32_t)mbp->msg_bufx);
++	}
++#endif
+ }
+ 
+ /*
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -102,6 +102,11 @@
+ #include <mach/shared_region.h>
+ #include <vm/vm_shared_region.h>
+ 
++#if defined(__arm64__)
++#include <arm64/laguna_panicdump.h>
++#include <arm64/laguna_lastwords.h>
++#endif
++
+ #include <vm/vm_dyld_pager.h>
+ 
+ #include <vm/vm_protos.h>
+@@ -2074,6 +2079,16 @@
+ 	kern_return_t           kr;
+ 	task_t                  task = current_task();
+ 
++#if defined(__arm64__)
++	if (proc_getpid(p) == 1) {
++		/* R4 (laguna mirror port, 0129): a PID 1 syscall is the first stamp
++		 * that can only be reached after exec returned toward
++		 * dyld/userland. */
++		(void)laguna_panicdump_stage(LW_STAGE_DYLD_SHARED_REGION,
++		    LW_PRODUCER_XNU_KERNEL, 0, (uint64_t)uap->start_address,
++		    0, 0, 0, "pid1 shared_region_check_np");
++	}
++#endif
+ 	SHARED_REGION_TRACE_DEBUG(
+ 		("shared_region: %p [%d(%s)] -> check_np(0x%llx)\n",
+ 		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+--- a/iokit/Kernel/MiniAppleKeyStore.cpp
++++ b/iokit/Kernel/MiniAppleKeyStore.cpp
+@@ -120,6 +120,13 @@
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleKeyStore, IOService);
++
++#if defined(__arm64__)
++/* R4 laguna chain (ported, 0123): declared at file scope — linkage
++ * specifications are not allowed at block scope, and iokit C++ compiles do
++ * not carry the osfmk include paths. */
++extern "C" void laguna_panicdump_bootdone(void);
++#endif
+ 
+ bool
+ AppleKeyStore::start(IOService * provider)
+@@ -130,6 +137,13 @@
+ 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+ 	setName("AppleKeyStore");
+ 	registerService();
++#if defined(__arm64__)
++	/* R4 laguna chain arming site (ported, 0123 — the 141 tree used
++	 * LagunaKeyStore::start): the first laguna-platform IOKit driver start is
++	 * the earliest fully-threaded hook on every delivery path (kernel threads
++	 * are runnable in IOService::start, unlike arm_init). */
++	laguna_panicdump_bootdone();
++#endif
+ 	return true;
+ }
+ 
+--- /dev/null
++++ b/osfmk/arm64/laguna_panicdump.c
+@@ -0,0 +1,1185 @@
++/*
++ * laguna_panicdump — panic-path capture into the ramoops console zone.
++ * See laguna_panicdump.h for the contract (device truth, format, boot args).
++ *
++ * Linux-side semantics this file must stay byte-compatible with
++ * (linux-next fs/pstore/ram_core.c, no ECC — the DT ramoops@95200000 node
++ * carries no ecc-size):
++ *   struct persistent_ram_buffer { u32 sig; u32 start; u32 size; u8 data[]; }
++ *   PERSISTENT_RAM_SIG = 0x43474244; both the console and the pmsg zone are
++ *   created with per-zone sig 0, so the stored sig is 0x43474244 for both.
++ *   buffer_size = zone_size - sizeof(buffer) = zone_size - 12.
++ *   Zap (old content discarded) happens on Linux's next init when the stored
++ *   sig mismatches or start/size violate start <= size <= buffer_size.
++ *   console-ramoops-0 / pmsg-ramoops-0 file content = data[start..start+size)
++ *   wrap-linearized, oldest first — appended bytes show up at the file tail.
++ *
++ * The append mirrors persistent_ram_write() ring arithmetic exactly; the
++ * pmsg mirror is a raw fixed-offset record the same way the kexec marker
++ * (pmsg+0x100) and the MARKER-SCRATCH/diag-ring pages (pmsg+0x1000..0x12000)
++ * are raw placements — none of those touch the zone header, and neither does
++ * the mirror. XNU-MSGBUF v2 keeps all XNU-owned evidence out of the hostile
++ * low region (<+0x6000, see the v2 addendum in docs/XNU-MSGBUF-v1.md);
++ * research/check-pmsg-contract.py guards all of the offsets.
++ */
++#include <arm64/laguna_panicdump.h>
++#include <arm64/laguna_lastwords.h>
++
++#if defined(__arm64__) && !defined(LAGUNA_PANICDUMP_STUB)
++/* Port note (mach-choice lane): the 141 tree guarded this body with
++ * #if defined(LAGUNA) (its MASTER.arm64.laguna machine config). The blazer
++ * tree builds MACHINE_CONFIGS=BCM2837, where LAGUNA is not defined, so the
++ * guard would have compiled the stub path and silenced the whole evidence
++ * chain. The chain is always-on by design (lagunapanicdump=0 disables), so
++ * the guard is now __arm64__ with an explicit stub opt-out for host builds. */
++
++#include <stdint.h>
++
++#include <pexpert/pexpert.h>           /* kprintf, PE_parse_boot_argn */
++#include <machine/machine_routines.h>  /* ml_io_map, ml_validate_nofault,
++                                        * ml_nofault_copy (0124) */
++#include <kern/thread.h>               /* kernel_thread_start_priority */
++#include <kern/clock.h>                /* delay_for_interval (test needle) */
++#include <kern/debug.h>                /* panic_validate_ptr (0124) */
++#include <kern/startup.h>              /* STARTUP(OSLOG) msgbuf-resize hook */
++#include <sys/msgbuf.h>
++
++extern struct msgbuf *msgbufp;
++
++/* ---- placement constants (guarded by research/check-pmsg-contract.py) ---- */
++
++/* DT /reserved-memory/ramoops@95200000: reg 0x95200000+0x400000,
++ * console-size 0x200000 then pmsg-size 0x200000 (check-pmsg-contract.py
++ * computes console@0x95200000 pmsg@0x95400000 from the same node). */
++#define LAGUNA_RAMOOPS_BASE       0x95200000ull
++#define LAGUNA_RAMOOPS_SIZE       0x400000ull
++#define LAGUNA_CONSOLE_OFF        0x0ull
++#define LAGUNA_CONSOLE_SIZE       0x200000ull
++#define LAGUNA_PMSG_OFF           0x200000ull
++#define LAGUNA_PMSG_SIZE          0x200000ull
++
++/* Mirror record: pmsg zone +0x30000, window 0x2040. Clear of the handoff
++ * marker slots (+0x100..0x130), the boot_args smuggle page (+0x1000..0x2000),
++ * MARKER-SCRATCH (+0x1000..0x1043) and the diag ring (+0x1080 counter,
++ * +0x2000..0x12000 records); far enough up that Android's own /dev/pmsg0
++ * ring (appended at the zone tail, 2 MiB wrap) does not reach it per boot. */
++#define LAGUNA_MIRROR_OFF         0x30000ull
++#define LAGUNA_MIRROR_SIZE        0x2040ull
++#define LAGUNA_MIRROR_PAYLOAD_MAX 0x2000u   /* 8 KiB mirror payload cap */
++/* Linux fs/pstore/ram_core.c persistent_ram_buffer, no ECC. sizeof = 12. */
++#define LAGUNA_PRZ_HDR            12u
++#define LAGUNA_PRZ_SIG            0x43474244u
++
++/* Mirror record layout (little-endian, fixed 40-byte header). */
++#define LAGUNA_MIRROR_MAGIC2      0x50414e31u /* 'PAN1' quick-scan tag */
++#define LAGUNA_MMR_MAGIC2_OFF     16u
++#define LAGUNA_MMR_CRC_OFF        20u
++#define LAGUNA_MMR_LEN_OFF        24u
++#define LAGUNA_MMR_SEQ_OFF        28u
++#define LAGUNA_MMR_DATA_OFF       40u
++
++/* Capture budget (panic path must stay bounded). */
++#define LAGUNA_CAP_MSGBUF_MAX     0x4000u   /* 16 KiB msgbuf tail */
++#define LAGUNA_CAP_PANICLOG_MAX   0x8000u   /* 32 KiB paniclog */
++
++/* R4 always-on msgbuf mirror, XNU-MSGBUF v2 (0130): fixed 64-byte header +
++ * MAX_MSG_BSIZE ring.  V2 relocates every XNU-owned always-on channel out of
++ * the empirically hostile low pmsg region (2026-10-26 mirror-run dump
++ * r4z-kernel.log: ABL/TEE fastboot-re-entry log at +0x000..~0x900, the
++ * Linux-kexec handoff page +0x000..0xFFF = kexec seg 13, and the probe log
++ * ring +0x1080..~0x5C80; identical map in every retrieved dump).  The header
++ * now sits at +0x3F800 immediately below the unchanged 1 MiB ring at +0x40000
++ * (the ring window itself is bit-compatible with v1; only the header moved,
++ * so v1's embedded header at +0x40000 no longer exists in v2 output).
++ *
++ * The header's stream fields advance with EVERY accepted byte, so an early
++ * death never waits for a timer. seq versions the live-source metadata
++ * refreshes; it is deliberately not a validity/commit gate for the ring. */
++#define LAGUNA_LOGDUMP_HDR_OFF      0x3F800ull
++#define LAGUNA_LOGDUMP_OFF          0x40000ull /* ring data base (unchanged) */
++#define LAGUNA_LOGDUMP_HEADER_SIZE  0x40u
++#define LAGUNA_LOGDUMP_RING_SIZE    0x100000u /* MAX_MSG_BSIZE */
++#define LAGUNA_LOGDUMP_WINDOW_SIZE  (LAGUNA_LOGDUMP_HEADER_SIZE + \
++                                     LAGUNA_LOGDUMP_RING_SIZE)
++#define LAGUNA_LD_SEQ_OFF           0x10u
++#define LAGUNA_LD_FLAGS_OFF         0x14u
++#define LAGUNA_LD_MSGBUFP_OFF       0x18u
++#define LAGUNA_LD_BUFC_OFF          0x20u
++#define LAGUNA_LD_SIZE_OFF          0x28u
++#define LAGUNA_LD_BUFSIZE_OFF       0x28u /* source-contract alias */
++#define LAGUNA_LD_BUFX_OFF          0x2cu
++#define LAGUNA_LD_TOTAL_OFF         0x30u
++#define LAGUNA_LD_TAIL_OFF_OFF      0x38u
++#define LAGUNA_LD_TAIL_LEN_OFF      0x3cu
++
++#define LAGUNA_LD_FLAG_WRAPPED        (1u << 0)
++#define LAGUNA_LD_FLAG_PANIC          (1u << 1)
++#define LAGUNA_LD_FLAG_HALT           (1u << 2)
++#define LAGUNA_LD_FLAG_EARLY_REPLAY   (1u << 3)
++#define LAGUNA_LD_FLAG_SOURCE_INVALID (1u << 4)
++
++/* V2 relocated compact breadcrumb trail + XNU-owned counters, one 128-byte
++ * page at pmsg+0x28000..0x280ff.  Twelve LE stage-code words are chrono-
++ * logical/nondecreasing; LGLW remains the CRC/DONE authoritative channel.
++ * Entry clears exactly the 48 breadcrumb bytes every boot.  The boot counter
++ * increments once per enabled boot (persists across boots); the diag counter
++ * increments on every mirror flush (proves the periodic thread was alive).
++ * Both are clear of the probe log (ends ~+0x5C80), the diag-ring/boot-args
++ * placements (<+0x12000), the PAN1 mirror (+0x30000..0x32040), and the
++ * logdump header/ring (>= +0x3F800). */
++#define LAGUNA_STAGE_COMPACT_OFF   0x28000ull
++#define LAGUNA_STAGE_COMPACT_WORDS 12u
++#define LAGUNA_STAGE_COMPACT_SIZE  (LAGUNA_STAGE_COMPACT_WORDS * 4u)
++#define LAGUNA_BOOTCTR_OFF         0x28040ull
++#define LAGUNA_DIAGCTR_OFF         0x28080ull
++#define LAGUNA_V2_CTR_MAX          0xfffffffeu /* sanitized like LGLW seq */
++
++_Static_assert(LAGUNA_STAGE_COMPACT_OFF >= 0x12000ull,
++    "v2 compact trail overlaps the legacy diag-ring/boot-args placements");
++_Static_assert(LAGUNA_STAGE_COMPACT_OFF + LAGUNA_STAGE_COMPACT_SIZE <=
++    LAGUNA_BOOTCTR_OFF, "v2 compact trail overlaps the boot counter");
++_Static_assert(LAGUNA_BOOTCTR_OFF + 4 <= LAGUNA_DIAGCTR_OFF,
++    "v2 boot counter overlaps the diag counter");
++_Static_assert(LAGUNA_DIAGCTR_OFF + 4 <= 0x28100ull,
++    "v2 counters escape the relocated evidence page");
++_Static_assert(LAGUNA_LOGDUMP_HDR_OFF >= LAGUNA_DIAGCTR_OFF + 4 &&
++    LAGUNA_LOGDUMP_HDR_OFF >= LAGUNA_MIRROR_OFF + LAGUNA_MIRROR_SIZE,
++    "v2 header overlaps the counters or the PAN1 mirror");
++_Static_assert(LAGUNA_LOGDUMP_HDR_OFF + LAGUNA_LOGDUMP_HEADER_SIZE <=
++    LAGUNA_LOGDUMP_OFF, "v2 header overlaps the ring data");
++_Static_assert(LAGUNA_LOGDUMP_OFF + LAGUNA_LOGDUMP_RING_SIZE <=
++    LAGUNA_PMSG_SIZE, "logdump ring escapes the pmsg zone");
++_Static_assert(LAGUNA_LOGDUMP_RING_SIZE == MAX_MSG_BSIZE,
++    "logdump ring must cover XNU's largest msgbuf");
++
++_Static_assert(LAGUNA_MIRROR_SIZE >= LAGUNA_MMR_DATA_OFF + LAGUNA_MIRROR_PAYLOAD_MAX,
++    "mirror window too small for the payload cap");
++_Static_assert(LAGUNA_MIRROR_OFF + LAGUNA_MIRROR_SIZE <= LAGUNA_PMSG_SIZE,
++    "mirror window escapes the pmsg zone");
++_Static_assert(LAGUNA_MIRROR_OFF >= 0x12000ull,
++    "mirror window overlaps the diag-ring/boot-args placements");
++
++/* ---- zone state (init-time, read-only afterwards) ---- */
++
++static volatile uint8_t *laguna_pd_va;      /* ml_io_map of the 4 MiB zone */
++static volatile uint32_t laguna_pd_enabled; /* boot-arg gate passed + mapped */
++static volatile uint32_t laguna_pd_captured;/* a capture already ran */
++static volatile uint32_t laguna_pd_captured_len; /* its paniclog size */
++static volatile uint32_t laguna_pd_console_live; /* console header appendable */
++static uint32_t laguna_pd_test_secs;        /* lagunapanictest value (bootdone) */
++
++/* R4 mirror state. Appends are serialized by the existing BSD log lock;
++ * aligned volatile loads/stores are sufficient for lock-free dump readers and
++ * the periodic metadata thread. No new lock is ever taken on the log path. */
++static volatile uint32_t laguna_ld_enabled;
++static volatile uint32_t laguna_ld_disabled;
++static volatile uint32_t laguna_ld_thread_started;
++static volatile uint32_t laguna_ld_stage_compact_count;
++static volatile uint32_t laguna_ld_flags;
++static volatile uint32_t laguna_ld_seq;
++static volatile uint32_t laguna_ld_active_size;
++static volatile uint32_t laguna_ld_tail_len;
++static volatile uint64_t laguna_ld_total;
++
++/*
++ * 0124: panic-time staging for the msgbuf tail. The rung-2 capture used to
++ * read the BSD ring straight out of msgbufp->msg_bufc — and the QEMU
++ * evidence (evidence/ramoops-zone-qemu-pass.bin, decoded by
++ * tools/decode-device-panic.py) shows a nested panic with the CPU attributed
++ * to this capture: the ring buffer can be (re)moved under the panic path, so
++ * a direct dereference is exactly the kind of fault that tears the record.
++ * The tail is now staged with ml_nofault_copy() (physical-mode copy that
++ * stops cleanly on an unmapped page and reports how far it got), after
++ * panic_validate_ptr() checked both msgbufp and the ring span. A short copy
++ * is APPENDED AS-IS with an explicit note; no fault can tear the record.
++ */
++static uint8_t laguna_pd_mb_stage[LAGUNA_CAP_MSGBUF_MAX];
++
++static inline volatile uint8_t *
++laguna_pd_at(uint64_t zone_off)
++{
++	return laguna_pd_va + zone_off;
++}
++
++static inline const volatile uint8_t *
++laguna_pd_cat(uint64_t zone_off)
++{
++	return laguna_pd_va + zone_off;
++}
++
++/* ---- 0125-class LGLW stage records (RAM-dump producer) ---- */
++
++static int
++laguna_pd_lw_bounds(uint64_t pa, uint32_t len, uint64_t *zone_off)
++{
++	uint64_t off;
++
++	if (laguna_pd_va == NULL || pa < LAGUNA_RAMOOPS_BASE)
++		return 0;
++	off = pa - LAGUNA_RAMOOPS_BASE;
++	if (off > LAGUNA_RAMOOPS_SIZE ||
++	    (uint64_t)len > LAGUNA_RAMOOPS_SIZE - off)
++		return 0;
++	*zone_off = off;
++	return 1;
++}
++
++static long
++laguna_pd_lw_read(void *ctx, uint64_t pa, void *buf, uint32_t len)
++{
++	uint64_t off;
++	uint8_t *out = buf;
++	(void)ctx;
++	if (!laguna_pd_lw_bounds(pa, len, &off))
++		return -1;
++	for (uint32_t i = 0; i < len; i++)
++		out[i] = *laguna_pd_cat(off + i);
++	return 0;
++}
++
++static long
++laguna_pd_lw_write(void *ctx, uint64_t pa, const void *buf, uint32_t len)
++{
++	uint64_t off;
++	const uint8_t *in = buf;
++	(void)ctx;
++	if (!laguna_pd_lw_bounds(pa, len, &off))
++		return -1;
++	for (uint32_t i = 0; i < len; i++)
++		*laguna_pd_at(off + i) = in[i];
++	return 0;
++}
++
++static long
++laguna_pd_lw_clean(void *ctx, uint64_t pa, uint32_t len)
++{
++	uint64_t off;
++	(void)ctx;
++	if (!laguna_pd_lw_bounds(pa, len, &off))
++		return -1;
++	/* ml_io_map Device-memory stores are already uncacheable. */
++	__asm__ volatile("dsb sy" ::: "memory");
++	return 0;
++}
++
++static struct lw_mem laguna_pd_lw_mem = {
++	.ctx = NULL,
++	.read = laguna_pd_lw_read,
++	.write = laguna_pd_lw_write,
++	.clean = laguna_pd_lw_clean,
++};
++
++static void
++laguna_logdump_compact_stage(uint32_t stage)
++{
++	const uint64_t cbase = LAGUNA_PMSG_OFF + LAGUNA_STAGE_COMPACT_OFF;
++	uint32_t count = laguna_ld_stage_compact_count;
++
++	if (!laguna_ld_enabled || stage == 0 || stage > 12 ||
++	    count >= LAGUNA_STAGE_COMPACT_WORDS) {
++		return;
++	}
++	*(volatile uint32_t *)(void *)laguna_pd_at(cbase + count * 4u) = stage;
++	__asm__ volatile("dsb sy" ::: "memory");
++	laguna_ld_stage_compact_count = count + 1;
++}
++
++/* Safe before init and from the panic rungs: disabled = 0, otherwise the
++ * lw_write result (positive sequence or negative error).  No allocation,
++ * locks, printf, or unchecked panic-string dereference. */
++long
++laguna_panicdump_stage(uint32_t stage, uint32_t producer, uint32_t flags,
++    uint64_t detail0, uint64_t detail1, uint64_t detail2, uint64_t detail3,
++    const char *note)
++{
++	struct lw_event event;
++
++	/* R4: both independent gates must opt in. lagunalogdump=0 suppresses
++	 * additive breadcrumbs without disabling the 0123/0124 panic capture. */
++	if (!laguna_pd_enabled || !laguna_ld_enabled)
++		return 0;
++	event.stage = stage;
++	event.producer = producer;
++	event.flags = flags;
++	event.detail[0] = detail0;
++	event.detail[1] = detail1;
++	event.detail[2] = detail2;
++	event.detail[3] = detail3;
++	event.note = note;
++	{
++		long rc = lw_write(&laguna_pd_lw_mem, &event);
++		if (rc > 0) {
++			laguna_logdump_compact_stage(stage);
++		}
++		return rc;
++	}
++}
++
++/* ---- CRC-32/IEEE, table-free (same polynomial as the diag ring) ---- */
++
++static uint32_t
++laguna_pd_crc32(const volatile uint8_t *p, uint32_t n)
++{
++	uint32_t c = 0xffffffffu;
++	uint32_t i;
++	int b;
++
++	for (i = 0; i < n; i++) {
++		c ^= p[i];
++		for (b = 0; b < 8; b++) {
++			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
++		}
++	}
++	return ~c;
++}
++
++static void laguna_panicdump_test_thread(void *arg, int wait_result);
++
++/* ---- raw zone access (Device memory: aligned volatile word ops) ---- */
++
++static inline uint32_t
++laguna_pd_rd32(uint64_t zone_off)
++{
++	return *(const volatile uint32_t *)(const void *)laguna_pd_cat(zone_off);
++}
++
++static inline void
++laguna_pd_wr32(uint64_t zone_off, uint32_t v)
++{
++	*(volatile uint32_t *)(void *)laguna_pd_at(zone_off) = v;
++}
++
++static inline void
++laguna_pd_wr64(uint64_t zone_off, uint64_t v)
++{
++	*(volatile uint64_t *)(void *)laguna_pd_at(zone_off) = v;
++}
++
++static inline uint64_t
++laguna_pd_rd64(uint64_t zone_off)
++{
++	return *(const volatile uint64_t *)(const void *)laguna_pd_cat(zone_off);
++}
++
++/* ---- R4 always-on XNU-MSGBUF v2 mirror ---- */
++
++static int
++laguna_pd_map(void)
++{
++	if (laguna_pd_va == NULL) {
++		/* One shared mapping for panic capture, LGLW and the log mirror.
++		 * The physmap does not cover this low bank, and a second early
++		 * ml_io_map would exhaust the bootstrap I/O page-table window. */
++		laguna_pd_va = (volatile uint8_t *)(uintptr_t)ml_io_map(
++		    (vm_offset_t)LAGUNA_RAMOOPS_BASE,
++		    (vm_size_t)LAGUNA_RAMOOPS_SIZE);
++	}
++	return laguna_pd_va != NULL;
++}
++
++static void
++laguna_logdump_append(char c, uint32_t bufx)
++{
++	const uint64_t hbase = LAGUNA_PMSG_OFF + LAGUNA_LOGDUMP_HDR_OFF;
++	const uint64_t rbase = LAGUNA_PMSG_OFF + LAGUNA_LOGDUMP_OFF;
++	uint64_t total, next;
++	uint32_t active, tail_len, tail_off;
++
++	if (!laguna_ld_enabled || laguna_pd_va == NULL) {
++		return;
++	}
++	active = laguna_ld_active_size;
++	if (active == 0 || active > LAGUNA_LOGDUMP_RING_SIZE) {
++		return;
++	}
++	total = laguna_ld_total;
++	*laguna_pd_at(rbase + (total % active)) = (uint8_t)c;
++	next = total + 1;
++	laguna_ld_total = next;
++
++	/* Data first, then the live stream metadata. tail_len never leads the
++	 * corresponding byte, so even a reset between these stores cannot make
++	 * the reader consume a not-yet-written byte as current log data. R2's
++	 * geometry is exact: bufx == total % live_size and the retained tail
++	 * starts at (total - tail_len) % live_size. */
++	if (laguna_ld_tail_len < active) {
++		laguna_ld_tail_len++;
++	}
++	tail_len = laguna_ld_tail_len;
++	tail_off = (uint32_t)((next - tail_len) % active);
++	laguna_pd_wr64(hbase + LAGUNA_LD_TOTAL_OFF, next);
++	laguna_pd_wr32(hbase + LAGUNA_LD_TAIL_LEN_OFF, tail_len);
++	laguna_pd_wr32(hbase + LAGUNA_LD_TAIL_OFF_OFF, tail_off);
++	laguna_pd_wr32(hbase + LAGUNA_LD_BUFX_OFF, bufx);
++	if (next > active && total <= active) {
++		laguna_ld_flags |= LAGUNA_LD_FLAG_WRAPPED;
++		laguna_pd_wr32(hbase + LAGUNA_LD_FLAGS_OFF, laguna_ld_flags);
++	}
++}
++
++void
++laguna_logdump_putc(char c, uint32_t bufx)
++{
++	laguna_logdump_append(c, bufx);
++}
++
++static int
++laguna_logdump_source_snapshot(uint32_t reason, uint64_t *mbva,
++    uint64_t *bcva, uint32_t *size, uint32_t *bufx)
++{
++	struct msgbuf *mb = msgbufp;
++	char *bufc;
++	int magic, ssize, sbufx, sbufr;
++
++	if (mb == NULL) {
++		return 0;
++	}
++	if ((reason & (LAGUNA_LOGDUMP_FLUSH_PANIC |
++	    LAGUNA_LOGDUMP_FLUSH_HALT)) &&
++	    !panic_validate_ptr(mb, (vm_size_t)sizeof(*mb), "msgbufp")) {
++		return 0;
++	}
++
++	/* Do not dereference msg_bufc here. The fixed mirror is authoritative;
++	 * these fields only let R2 cross-check the live source when a full RAM
++	 * dump is available. Panic/halt still validates that source span using
++	 * the exact 0124 nofault discipline before publishing its metadata. */
++	magic = mb->msg_magic;
++	ssize = mb->msg_size;
++	sbufx = mb->msg_bufx;
++	sbufr = mb->msg_bufr;
++	bufc = mb->msg_bufc;
++	if (magic != MSG_MAGIC || ssize <= 0 || ssize > MAX_MSG_BSIZE ||
++	    sbufx < 0 || sbufx > ssize || sbufr < 0 || sbufr > ssize) {
++		return 0;
++	}
++	if ((reason & (LAGUNA_LOGDUMP_FLUSH_PANIC |
++	    LAGUNA_LOGDUMP_FLUSH_HALT)) &&
++	    !ml_validate_nofault((vm_offset_t)bufc, (vm_size_t)ssize)) {
++		return 0;
++	}
++
++	*mbva = (uint64_t)(uintptr_t)mb;
++	*bcva = (uint64_t)(uintptr_t)bufc;
++	*size = (uint32_t)ssize;
++	*bufx = (uint32_t)sbufx;
++	return 1;
++}
++
++void
++laguna_logdump_flush(uint32_t reason)
++{
++	const uint64_t hbase = LAGUNA_PMSG_OFF + LAGUNA_LOGDUMP_HDR_OFF;
++	uint64_t mbva, bcva;
++	uint32_t size, bufx, flags, seq, diag;
++
++	if (!laguna_ld_enabled || laguna_pd_va == NULL) {
++		return;
++	}
++	/* A failed source inspection must not make the authoritative fixed ring
++	 * unreadable. Retain the last valid source metadata and mark the fault. */
++	mbva = laguna_pd_rd64(hbase + LAGUNA_LD_MSGBUFP_OFF);
++	bcva = laguna_pd_rd64(hbase + LAGUNA_LD_BUFC_OFF);
++	size = laguna_pd_rd32(hbase + LAGUNA_LD_SIZE_OFF);
++	bufx = laguna_pd_rd32(hbase + LAGUNA_LD_BUFX_OFF);
++	flags = laguna_ld_flags;
++	if (laguna_logdump_source_snapshot(reason, &mbva, &bcva,
++	    &size, &bufx)) {
++		flags &= ~LAGUNA_LD_FLAG_SOURCE_INVALID;
++	} else {
++		flags |= LAGUNA_LD_FLAG_SOURCE_INVALID;
++	}
++	flags |= reason & (LAGUNA_LOGDUMP_FLUSH_PANIC |
++	    LAGUNA_LOGDUMP_FLUSH_HALT);
++	laguna_ld_flags = flags;
++
++	laguna_pd_wr64(hbase + LAGUNA_LD_MSGBUFP_OFF, mbva);
++	laguna_pd_wr64(hbase + LAGUNA_LD_BUFC_OFF, bcva);
++	laguna_pd_wr32(hbase + LAGUNA_LD_SIZE_OFF, size);
++
++	/* total/tail/bufx belong exclusively to append/replay. A periodic flush
++	 * must never combine a pre-append source index with a post-append total. */
++	laguna_pd_wr32(hbase + LAGUNA_LD_FLAGS_OFF, flags);
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	/* V2 diag counter: one increment per completed flush event. A nonzero,
++	 * advancing counter proves the mirror machinery (periodic thread,
++	 * startup hook, panic/halt rungs) executed after init, independent of
++	 * the per-byte stream. Sanitized so zone garbage cannot truncate it. */
++	diag = laguna_pd_rd32(LAGUNA_PMSG_OFF + LAGUNA_DIAGCTR_OFF);
++	diag = (diag == 0 || diag >= LAGUNA_V2_CTR_MAX) ? 1u : diag + 1u;
++	laguna_pd_wr32(LAGUNA_PMSG_OFF + LAGUNA_DIAGCTR_OFF, diag);
++
++	seq = laguna_ld_seq + 1;
++	if (seq == 0 || seq > 0xfffffffdu) {
++		seq = 1;
++	}
++	laguna_ld_seq = seq;
++	laguna_pd_wr32(hbase + LAGUNA_LD_SEQ_OFF, seq);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++laguna_logdump_replay(void)
++{
++	const uint64_t hbase = LAGUNA_PMSG_OFF + LAGUNA_LOGDUMP_HDR_OFF;
++	struct msgbuf *mb = msgbufp;
++
++	laguna_ld_total = 0;
++	laguna_ld_tail_len = 0;
++	laguna_ld_flags &= ~LAGUNA_LD_FLAG_WRAPPED;
++	if (mb == NULL || mb->msg_magic != MSG_MAGIC ||
++	    mb->msg_size <= 0 || mb->msg_size > MAX_MSG_BSIZE ||
++	    mb->msg_bufc == NULL) {
++		laguna_ld_active_size = 0;
++		laguna_pd_wr32(hbase + LAGUNA_LD_SIZE_OFF, 0);
++		laguna_pd_wr64(hbase + LAGUNA_LD_TOTAL_OFF, 0);
++		laguna_pd_wr32(hbase + LAGUNA_LD_TAIL_LEN_OFF, 0);
++		laguna_pd_wr32(hbase + LAGUNA_LD_TAIL_OFF_OFF, 0);
++		laguna_pd_wr32(hbase + LAGUNA_LD_BUFX_OFF, 0);
++		return;
++	}
++
++	{
++		uint32_t size = (uint32_t)mb->msg_size;
++		uint32_t bx = (uint32_t)mb->msg_bufx;
++		uint32_t br = (uint32_t)mb->msg_bufr;
++		uint32_t used, start;
++
++		laguna_ld_active_size = size;
++		if (bx > size || br > size) {
++			laguna_ld_active_size = 0;
++			laguna_pd_wr32(hbase + LAGUNA_LD_SIZE_OFF, 0);
++			laguna_pd_wr64(hbase + LAGUNA_LD_TOTAL_OFF, 0);
++			laguna_pd_wr32(hbase + LAGUNA_LD_TAIL_LEN_OFF, 0);
++			laguna_pd_wr32(hbase + LAGUNA_LD_TAIL_OFF_OFF, 0);
++			laguna_pd_wr32(hbase + LAGUNA_LD_BUFX_OFF, 0);
++			return;
++		}
++		used = bx >= br ? bx - br : size - br + bx;
++		if (used == 0) {
++			for (uint32_t i = 0; i < size; i++) {
++				if (mb->msg_bufc[i] != '\0') {
++					used = size;
++					break;
++				}
++			}
++		}
++		if (used > bx) {
++			used = size; /* wrapped/read-pointer ambiguity: replay full ring */
++		}
++
++		/* Seed stream geometry so the replay ends with total % size == bx.
++		 * A full ring has one absolute wrap plus bx; a partial ring retains
++		 * exactly used bytes beginning at (bx-used) == br. */
++		laguna_ld_total = used == size ? bx : bx - used;
++		laguna_pd_wr32(hbase + LAGUNA_LD_SIZE_OFF, size);
++		laguna_pd_wr64(hbase + LAGUNA_LD_TOTAL_OFF, laguna_ld_total);
++		laguna_pd_wr32(hbase + LAGUNA_LD_TAIL_LEN_OFF, 0);
++		laguna_pd_wr32(hbase + LAGUNA_LD_TAIL_OFF_OFF, 0);
++		laguna_pd_wr32(hbase + LAGUNA_LD_BUFX_OFF, bx);
++		laguna_pd_wr32(hbase + LAGUNA_LD_FLAGS_OFF, laguna_ld_flags);
++		start = (bx + size - used) % size;
++		for (uint32_t i = 0; i < used; i++) {
++			laguna_logdump_append(mb->msg_bufc[(start + i) % size], bx);
++		}
++	}
++}
++
++void
++laguna_logdump_early_init(void)
++{
++	static const char magic[LAGUNA_LOGDUMP_HEADER_SIZE] = "XNU-MSGBUF v2";
++	const uint64_t hbase = LAGUNA_PMSG_OFF + LAGUNA_LOGDUMP_HDR_OFF;
++	uint32_t arg = 1;
++
++	if (laguna_ld_enabled || laguna_ld_disabled) {
++		return;
++	}
++	(void)PE_parse_boot_argn("lagunalogdump", &arg, (int)sizeof(arg));
++	if (!arg) {
++		laguna_ld_disabled = 1;
++		return;
++	}
++	if (!laguna_pd_map()) {
++		return; /* late_init may retry after the existing panic init */
++	}
++
++	for (uint32_t i = 0; i < LAGUNA_LOGDUMP_HEADER_SIZE; i++) {
++		*laguna_pd_at(hbase + i) = 0;
++	}
++	for (uint32_t i = 0; i < sizeof(magic); i++) {
++		*laguna_pd_at(hbase + i) = (uint8_t)magic[i];
++	}
++	laguna_ld_total = 0;
++	laguna_ld_tail_len = 0;
++	laguna_ld_seq = 0;
++	laguna_ld_flags = 0;
++
++	/* V2 boot counter: persists across boots (never cleared). Sanitized so
++	 * stale-zone garbage or an exhausted word restarts at 1. */
++	{
++		uint32_t boots = laguna_pd_rd32(LAGUNA_PMSG_OFF + LAGUNA_BOOTCTR_OFF);
++		boots = (boots == 0 || boots >= LAGUNA_V2_CTR_MAX) ? 1u : boots + 1u;
++		laguna_pd_wr32(LAGUNA_PMSG_OFF + LAGUNA_BOOTCTR_OFF, boots);
++	}
++
++	laguna_ld_enabled = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	/* start.s already cleared the compact trail and, when enabled, wrote
++	 * XNU_ENTRY. Recover its append position without erasing that evidence. */
++	laguna_ld_stage_compact_count = 0;
++	while (laguna_ld_stage_compact_count < LAGUNA_STAGE_COMPACT_WORDS &&
++	    laguna_pd_rd32(LAGUNA_PMSG_OFF + LAGUNA_STAGE_COMPACT_OFF +
++	    laguna_ld_stage_compact_count * 4u) != 0) {
++		laguna_ld_stage_compact_count++;
++	}
++
++	/* msgbuf is statically initialized before this point. Replay its current
++	 * stream in source-ring geometry before accepting new bytes directly. */
++	laguna_logdump_replay();
++	laguna_ld_flags |= LAGUNA_LD_FLAG_EARLY_REPLAY;
++	laguna_logdump_flush(0);
++}
++
++void
++laguna_logdump_late_init(void)
++{
++	if (!laguna_ld_enabled && !laguna_ld_disabled) {
++		laguna_logdump_early_init();
++	}
++	if (laguna_ld_disabled) {
++		kprintf("LAGUNA LOGDUMP: disabled by lagunalogdump=0\n");
++		return;
++	}
++	if (!laguna_ld_enabled) {
++		kprintf("LAGUNA LOGDUMP: ramoops map unavailable\n");
++		return;
++	}
++	kprintf("LAGUNA LOGDUMP: armed (XNU-MSGBUF v2 hdr @pmsg+0x%x, "
++	    "ring @pmsg+0x%x, %u KiB, bc/dr+0x%x/+0x%x)\n",
++	    (uint32_t)LAGUNA_LOGDUMP_HDR_OFF, (uint32_t)LAGUNA_LOGDUMP_OFF,
++	    LAGUNA_LOGDUMP_RING_SIZE / 1024, (uint32_t)LAGUNA_BOOTCTR_OFF,
++	    (uint32_t)LAGUNA_DIAGCTR_OFF);
++	laguna_logdump_flush(0);
++}
++
++__startup_func
++static void
++laguna_logdump_oslog_ready(void)
++{
++	/* oslog_init_msgbuf is RANK_SECOND. Its optional msgbuf=n resize has
++	 * completed. Rebase the active ring into the new source geometry instead
++	 * of appending with a new modulus over incompatible old positions. */
++	laguna_logdump_replay();
++	laguna_logdump_flush(0);
++}
++STARTUP(OSLOG, STARTUP_RANK_THIRD, laguna_logdump_oslog_ready);
++
++static void
++laguna_logdump_thread(void *arg __unused, int wait_result __unused)
++{
++	thread_set_thread_name(current_thread(), "laguna-logdump");
++	for (;;) {
++		delay_for_interval(1, NSEC_PER_SEC);
++		laguna_logdump_flush(0);
++	}
++}
++
++static void
++laguna_logdump_start(void)
++{
++	thread_t thrd = THREAD_NULL;
++
++	if (!laguna_ld_enabled || laguna_ld_thread_started) {
++		return;
++	}
++	laguna_ld_thread_started = 1;
++	if (kernel_thread_start_priority(laguna_logdump_thread, NULL, -1,
++	    &thrd) == KERN_SUCCESS) {
++		thread_deallocate(thrd);
++	} else {
++		laguna_ld_thread_started = 0;
++		kprintf("LAGUNA LOGDUMP: periodic thread start failed; direct mirror remains live\n");
++	}
++}
++
++/* ---- persistent_ram ring append (mirror of persistent_ram_write) ---- */
++static void
++laguna_pd_console_append(const char *s, uint32_t n)
++{
++	const uint64_t cbase = LAGUNA_CONSOLE_OFF;
++	const uint32_t bufsz = (uint32_t)(LAGUNA_CONSOLE_SIZE - LAGUNA_PRZ_HDR);
++	uint32_t start, size, c, pos, rem;
++
++	if (!laguna_pd_console_live || laguna_pd_va == NULL || n == 0) {
++		return;
++	}
++
++	/* Linux clamps to the buffer size and keeps the TAIL of the input. */
++	c = n;
++	if (c > bufsz) {
++		s += c - bufsz;
++		c = bufsz;
++	}
++
++	start = laguna_pd_rd32(cbase + 4u);
++	size = laguna_pd_rd32(cbase + 8u);
++	if (start > bufsz || size > bufsz) {
++		laguna_pd_console_live = 0;   /* Linux would zap anyway */
++		return;
++	}
++
++	/* data first: a fault here leaves the header in the old state. */
++	pos = start;
++	rem = bufsz - pos;
++	if (rem > c) {
++		rem = c;
++	}
++	for (uint32_t i = 0; i < rem; i++) {
++		*laguna_pd_at(cbase + LAGUNA_PRZ_HDR + pos + i) = (uint8_t)s[i];
++	}
++	if (rem < c) {
++		const uint32_t rest = c - rem;
++		for (uint32_t i = 0; i < rest; i++) {
++			*laguna_pd_at(cbase + LAGUNA_PRZ_HDR + i) = (uint8_t)s[rem + i];
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	/* header second: size grows first, then start wraps (the exact
++	 * persistent_ram_write update order; final state identical). */
++	if (size != bufsz) {
++		uint32_t new_size = size + c;
++		if (new_size > bufsz) {
++			new_size = bufsz;
++		}
++		laguna_pd_wr32(cbase + 8u, new_size);
++	}
++	uint32_t new_start = start + c;
++	while (new_start >= bufsz) {
++		new_start -= bufsz;
++	}
++	laguna_pd_wr32(cbase + 4u, new_start);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++laguna_pd_console_str(const char *s)
++{
++	uint32_t n = 0;
++
++	if (s == NULL) {
++		return;
++	}
++	while (s[n] != '\0' && n < 128u) {
++		n++;
++	}
++	laguna_pd_console_append(s, n);
++}
++
++/* ---- pmsg mirror record (fixed offset, own CRC; newest wins) ---- */
++
++static void
++laguna_pd_mirror_write(const char *msg, const char *paniclog, uint32_t plen)
++{
++	static const char magic[16] = "XNU-PANIC v1";
++	const uint64_t rbase = LAGUNA_PMSG_OFF + LAGUNA_MIRROR_OFF;
++	uint32_t seq = 1;
++	uint32_t mlen = 0;
++	uint32_t pl = plen;
++	uint32_t crc;
++	uint32_t i;
++
++	if (laguna_pd_va == NULL) {
++		return;
++	}
++
++	/* Seq = previous valid record's seq + 1, sanitized on garbage. */
++	if (laguna_pd_rd32(rbase + LAGUNA_MMR_MAGIC2_OFF) == LAGUNA_MIRROR_MAGIC2) {
++		uint32_t prev = laguna_pd_rd32(rbase + LAGUNA_MMR_SEQ_OFF);
++		if (prev != 0xffffffffu && prev < 0xfffffffeu) {
++			seq = prev + 1u;
++		}
++	}
++
++	/* Assemble the payload directly in the zone, then CRC it from there.
++	 * Every store stays inside [rbase, rbase + LAGUNA_MIRROR_SIZE). */
++	if (msg != NULL) {
++		for (i = 0; msg[i] != '\0' && mlen < LAGUNA_MIRROR_PAYLOAD_MAX - 2u; i++) {
++			*laguna_pd_at(rbase + LAGUNA_MMR_DATA_OFF + mlen++) = (uint8_t)msg[i];
++		}
++	}
++	if (plen > 0 && paniclog != NULL && mlen < LAGUNA_MIRROR_PAYLOAD_MAX - 2u) {
++		*laguna_pd_at(rbase + LAGUNA_MMR_DATA_OFF + mlen++) = '\n';
++		if (pl > LAGUNA_MIRROR_PAYLOAD_MAX - mlen - 1u) {
++			pl = LAGUNA_MIRROR_PAYLOAD_MAX - mlen - 1u;
++		}
++		for (i = 0; i < pl; i++) {
++			*laguna_pd_at(rbase + LAGUNA_MMR_DATA_OFF + mlen++) = (uint8_t)paniclog[i];
++		}
++	}
++	/* Zero the stale tail of the payload window (previous records may have
++	 * been longer) so old bytes never read as data. */
++	for (i = mlen; i < LAGUNA_MIRROR_PAYLOAD_MAX; i++) {
++		*laguna_pd_at(rbase + LAGUNA_MMR_DATA_OFF + i) = 0;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	crc = laguna_pd_crc32(laguna_pd_cat(rbase + LAGUNA_MMR_DATA_OFF), mlen);
++
++	/* magic, then metadata — the quick-scan tag goes last for
++	 * crash-consistency (a torn write leaves the old record invalid or
++	 * the new one absent, never a half-valid new one). */
++	for (i = 0; i < sizeof(magic); i++) {
++		*laguna_pd_at(rbase + i) = (uint8_t)magic[i];
++	}
++	laguna_pd_wr32(rbase + LAGUNA_MMR_CRC_OFF, crc);
++	laguna_pd_wr32(rbase + LAGUNA_MMR_LEN_OFF, mlen);
++	laguna_pd_wr32(rbase + LAGUNA_MMR_SEQ_OFF, seq);
++	laguna_pd_wr32(rbase + LAGUNA_MMR_MAGIC2_OFF, LAGUNA_MIRROR_MAGIC2);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* ---- init ---- */
++
++void
++laguna_panicdump_init(void)
++{
++	uint32_t dump_arg = 1;   /* default ON */
++	uint32_t test_arg = 0;   /* default off */
++
++	(void)PE_parse_boot_argn("lagunapanicdump", &dump_arg,
++	    (int)sizeof(dump_arg));
++	if (!dump_arg) {
++		kprintf("LAGUNA PANICDUMP: disabled by lagunapanicdump=0\n");
++		return;
++	}
++
++	/* The physmap does not cover the low bank (device: declared-clean
++	 * RAM is 0x8_80000000+; QEMU contract: 0x80000000+256 MiB ends at
++	 * 0x90000000). Reuse the one early Device mapping if R4 already made it. */
++	if (!laguna_pd_map()) {
++		kprintf("LAGUNA PANICDUMP: ml_io_map of ramoops failed — capture unavailable\n");
++		return;
++	}
++
++	/* Validate the console header the way Linux's persistent_ram_post_init
++	 * does; repair an EMPTY (zapped) zone so our record can lead the stream
++	 * until ABL appends after it. A zapped-but-unwritten zone has no ABL
++	 * data to clobber. */
++	{
++		uint32_t sig = laguna_pd_rd32(LAGUNA_CONSOLE_OFF);
++		uint32_t start = laguna_pd_rd32(LAGUNA_CONSOLE_OFF + 4u);
++		uint32_t size = laguna_pd_rd32(LAGUNA_CONSOLE_OFF + 8u);
++		uint32_t bufsz = (uint32_t)(LAGUNA_CONSOLE_SIZE - LAGUNA_PRZ_HDR);
++
++		laguna_pd_console_live = 0;
++		if (sig == LAGUNA_PRZ_SIG && start <= bufsz && size <= bufsz) {
++			laguna_pd_console_live = 1;
++			kprintf("LAGUNA PANICDUMP: console zone sig ok, start=%u size=%u\n",
++			    start, size);
++		} else if ((sig == 0 || sig == LAGUNA_PRZ_SIG) && start == 0 && size == 0) {
++			/* ABL erased the zone (fresh/zeroed header): seed a valid
++			 * empty header; Linux accepts an empty existing buffer. */
++			laguna_pd_wr32(LAGUNA_CONSOLE_OFF, LAGUNA_PRZ_SIG);
++			laguna_pd_wr32(LAGUNA_CONSOLE_OFF + 4u, 0);
++			laguna_pd_wr32(LAGUNA_CONSOLE_OFF + 8u, 0);
++			__asm__ volatile("dsb sy" ::: "memory");
++			laguna_pd_console_live = 1;
++			kprintf("LAGUNA PANICDUMP: console zone seeded (was sig=%08x)\n", sig);
++		} else {
++			kprintf("LAGUNA PANICDUMP: console zone invalid (sig=%08x start=%u size=%u) — pmsg mirror only\n",
++			    sig, start, size);
++		}
++	}
++
++	laguna_pd_enabled = 1;
++	{
++		long lwrc = laguna_panicdump_stage(LW_STAGE_XNU_INIT,
++		    LW_PRODUCER_XNU_KERNEL, 0, LAGUNA_RAMOOPS_BASE,
++		    LAGUNA_RAMOOPS_SIZE, 0, 0, "laguna_panicdump_init armed");
++		if (lwrc < 0) {
++			kprintf("LAGUNA LASTWORDS: XNU_INIT write failed rc=%ld\n", lwrc);
++		}
++	}
++	kprintf("LAGUNA PANICDUMP: armed (console=%s mirror@pmsg+0x%x)\n",
++	    laguna_pd_console_live ? "live" : "off",
++	    (uint32_t)LAGUNA_MIRROR_OFF);
++
++	(void)PE_parse_boot_argn("lagunapanictest", &test_arg,
++	    (int)sizeof(test_arg));
++	laguna_pd_test_secs = test_arg;
++	if (test_arg > 0) {
++		kprintf("LAGUNA PANICTEST: %u s (armed at bsdinit_task, before load_init_program)\n",
++		    test_arg);
++	}
++}
++
++/*
++ * Called from the first laguna IOKit driver start (AppleKeyStore::start,
++ * iokit/Kernel/arm/LagunaKeyStore.cpp): the earliest fully-threaded hook on
++ * every delivery path. Spawns the lagunapanictest panic needle; idempotent
++ * (first caller wins).
++ */
++void
++laguna_panicdump_bootdone(void)
++{
++	thread_t thrd = THREAD_NULL;
++	uint32_t secs = laguna_pd_test_secs;
++
++	/* The periodic source-metadata thread is independent of the panic test
++	 * and of lagunapanicdump; direct per-byte mirroring is already live. */
++	laguna_logdump_start();
++	if (!laguna_pd_enabled || secs == 0) {
++		return;
++	}
++	laguna_pd_test_secs = 0;
++	if (kernel_thread_start_priority(laguna_panicdump_test_thread,
++	    (void *)(uintptr_t)secs, -1, &thrd) == KERN_SUCCESS) {
++		thread_deallocate(thrd);
++		kprintf("LAGUNA PANICTEST: armed, panicking in %u s\n", secs);
++	} else {
++		kprintf("LAGUNA PANICTEST: kernel_thread_start_priority failed — no forced panic\n");
++	}
++}
++
++/* ---- panic capture (called from SavePanicInfo, panic context) ---- */
++
++void
++laguna_panicdump_capture(const char *msg, const char *paniclog,
++    vm_size_t paniclog_len)
++{
++	uint32_t plen;
++
++	/* R4: BOTH rungs refresh the independent msgbuf mirror before the 0123
++	 * enable check and before the capture-size dedup. This also covers the
++	 * lagunapanicdump=0 + lagunalogdump=1 configuration. */
++	laguna_logdump_flush(LAGUNA_LOGDUMP_FLUSH_PANIC);
++	if (!laguna_pd_enabled) {
++		return;
++	}
++	plen = (uint32_t)paniclog_len;
++	if (paniclog == NULL) {
++		plen = 0;
++	} else if (plen > LAGUNA_CAP_PANICLOG_MAX) {
++		plen = LAGUNA_CAP_PANICLOG_MAX;
++	}
++
++	/*
++	 * Capture ladder: rung 1 (debugger_collect_diagnostics) fires with
++	 * just the panic string, rung 2 (SavePanicInfo, after
++	 * print_all_backtraces) fires with the full paniclog. A later rung
++	 * re-captures only when it has MORE text — the panic output can only
++	 * grow between the two sites, so this is exactly "replace the stub
++	 * with the full record". If the fuller rung aborts before its
++	 * capture, the earlier rung's record stands.
++	 */
++	if (laguna_pd_captured && plen <= laguna_pd_captured_len) {
++		return;
++	}
++	/* Commit PANIC before source validation, msgbuf staging, or either long
++	 * text writer.  A nested abort therefore still leaves the exact stage;
++	 * PAN1/console remain the authoritative panic-text channels. */
++	(void)laguna_panicdump_stage(LW_STAGE_PANIC, LW_PRODUCER_XNU_PANIC,
++	    LW_FLAG_FAILURE, plen, 0, 0, 0, "panic capture rung");
++	laguna_pd_captured = 1;
++	laguna_pd_captured_len = plen;
++
++	/*
++	 * 0124: validate the copy SOURCES before any consumer runs. The msg
++	 * pointer and the paniclog span are kernel-managed (and the paniclog
++	 * was written through before we got here), but the capture must never
++	 * be the first dereference of a bad translation: a fault here tears
++	 * the record mid-write. panic_validate_ptr/ml_validate_nofault are the
++	 * sanctioned panic-path guards (panic_validate_ptr uses exactly this).
++	 */
++	if (msg != NULL &&
++	    !ml_validate_nofault((vm_offset_t)msg, 1)) {
++		msg = NULL;
++	}
++	if (paniclog != NULL &&
++	    !ml_validate_nofault((vm_offset_t)paniclog, plen)) {
++		plen = 0;   /* record continues; mirror/console get message only */
++	}
++
++	/* pmsg mirror first: the guaranteed-survival channel (console zone
++	 * content is subject to ABL's own pstore erase policy). */
++	laguna_pd_mirror_write(msg, paniclog, plen);
++
++	/* console stream: native persistent_ram append — shows up in
++	 * console-ramoops-0 right after ABL's log. */
++	laguna_pd_console_str("\n\n----- XNU-PANIC-BEGIN (laguna141 xnu-8796.141.3) -----\n");
++	laguna_pd_console_str("panic message: ");
++	laguna_pd_console_str(msg != NULL ? msg : "(null)");
++	laguna_pd_console_str("\n");
++	if (plen > 0) {
++		laguna_pd_console_append(paniclog, plen);
++		laguna_pd_console_str("\n");
++	}
++
++	/*
++	 * kernel msgbuf tail (the pre-panic console log): the newest bytes of
++	 * the BSD ring. 0124 hardening — every pointer is
++	 * panic_validate_ptr'd BEFORE dereference and the ring itself is
++	 * staged with ml_nofault_copy (stops cleanly at an unmapped page,
++	 * returns the byte count), so a bad/relocated msg_bufc can no longer
++	 * abort the capture mid-record (the QEMU evidence showed exactly that
++	 * nested abort, frames attributed to this function). A short copy is
++	 * appended with an explicit note; the record always reaches END.
++	 */
++	{
++		if (msgbufp != NULL &&
++		    panic_validate_ptr(msgbufp,
++		    (vm_size_t)sizeof(struct msgbuf), "msgbufp") &&
++		    msgbufp->msg_magic == 0x063061 &&
++		    msgbufp->msg_size > 0 && msgbufp->msg_size <= (int)0x100000 &&
++		    panic_validate_ptr(msgbufp->msg_bufc,
++		    (vm_size_t)msgbufp->msg_size, "msgbuf ring")) {
++			uint32_t bufsz = (uint32_t)msgbufp->msg_size;
++			uint32_t bufx = (uint32_t)msgbufp->msg_bufx;
++			uint32_t n = LAGUNA_CAP_MSGBUF_MAX;
++
++			if (bufx > bufsz) {
++				bufx = bufsz;   /* torn index: clamp, don't fault */
++			}
++			if (n > bufsz) {
++				n = bufsz;
++			}
++			{
++				char hdr[96];
++				uint32_t hn = 0;
++				static const char tag[] =
++				    "\n----- msgbuf tail (last ";
++				static const char tail[] = " bytes) -----\n";
++				char num[12];
++				int v = (int)n, k = 0;
++
++				while (tag[hn] != '\0') {
++					hdr[hn] = tag[hn];
++					hn++;
++				}
++				while (v > 0) {
++					num[k++] = (char)('0' + (v % 10));
++					v /= 10;
++				}
++				while (k > 0) {
++					hdr[hn++] = num[--k];
++				}
++				for (uint32_t j = 0; tail[j] != '\0'; j++) {
++					hdr[hn++] = tail[j];
++				}
++				laguna_pd_console_append(hdr, hn);
++			}
++
++			/* 0124: stage the ring tail with ml_nofault_copy —
++			 * the copy stops at an unmapped page and returns how
++			 * far it got; nothing here can take an abort. The two
++			 * spans (tail-of-ring then wrap-to-front) are staged
++			 * in capture order so the append stays ring-aware. */
++			uint32_t from = (bufx + bufsz - n) % bufsz;
++			uint32_t lead = bufsz - from;
++			vm_size_t got = 0;
++
++			if (lead > n) {
++				lead = n;
++			}
++			got = ml_nofault_copy(
++			    (vm_offset_t)(msgbufp->msg_bufc + from),
++			    (vm_offset_t)laguna_pd_mb_stage, lead);
++			if (got < lead) {
++				lead = (uint32_t)got;
++				n = lead;   /* first span already short: stop */
++			} else if (lead < n) {
++				vm_size_t got2 = ml_nofault_copy(
++				    (vm_offset_t)msgbufp->msg_bufc,
++				    (vm_offset_t)(laguna_pd_mb_stage + lead),
++				    n - lead);
++				n = lead + (uint32_t)got2;
++			}
++			if (n > 0) {
++				laguna_pd_console_append(
++				    (const char *)laguna_pd_mb_stage, n);
++			}
++			if (n < LAGUNA_CAP_MSGBUF_MAX && n != bufsz) {
++				/* staged less than requested: say so, in-band,
++				 * instead of leaving the tail silently short */
++				static const char shortmsg[] =
++				    "\n----- msgbuf staged short (source "
++				    "validated out; record continues) -----\n";
++				laguna_pd_console_str(shortmsg);
++			}
++		} else {
++			laguna_pd_console_str(
++			    "----- msgbuf unavailable (validated out) -----\n");
++		}
++	}
++
++	laguna_pd_console_str("----- XNU-PANIC-END -----\n");
++}
++
++/* ---- test needle ---- */
++
++static void
++laguna_panicdump_test_thread(void *arg, int wait_result __unused)
++{
++	uint32_t secs = (uint32_t)(uintptr_t)arg;
++
++	thread_set_thread_name(current_thread(), "laguna-panicdump-test");
++	kprintf("LAGUNA PANICTEST: panicking in %u s\n", secs);
++	delay_for_interval(secs, NSEC_PER_SEC);
++	panic("lagunapanictest: forced panic for panic-capture validation");
++	/* not reached */
++}
++
++#else /* non-LAGUNA arm64 build stubs (the ramoops zone is laguna-only) */
++
++void
++laguna_panicdump_init(void)
++{
++}
++
++void
++laguna_panicdump_capture(
++    const char *msg __unused,
++    const char *paniclog __unused,
++    vm_size_t paniclog_len __unused)
++{
++}
++
++long
++laguna_panicdump_stage(uint32_t stage __unused, uint32_t producer __unused,
++    uint32_t flags __unused, uint64_t detail0 __unused,
++    uint64_t detail1 __unused, uint64_t detail2 __unused,
++    uint64_t detail3 __unused, const char *note __unused)
++{
++	return 0;
++}
++
++void
++laguna_panicdump_bootdone(void)
++{
++}
++
++void
++laguna_logdump_early_init(void)
++{
++}
++
++void
++laguna_logdump_late_init(void)
++{
++}
++
++void
++laguna_logdump_putc(char c __unused, uint32_t bufx __unused)
++{
++}
++
++void
++laguna_logdump_flush(uint32_t reason __unused)
++{
++}
++
++#endif /* LAGUNA */
+--- /dev/null
++++ b/osfmk/arm64/laguna_panicdump.h
+@@ -0,0 +1,109 @@
++/*
++ * laguna_panicdump — capture the kernel's panic output into the ramoops
++ * console zone (PA 0x95200000) on the panic path, plus a magic-tagged mirror
++ * record in the pmsg zone (PA 0x95400000).
++ *
++ * Device truth driving this: the teguload v3 ladder ran XNU on the Pixel 10
++ * Pro and the kernel panicked ~119 s in ("Early Kernel PANIC", CDD reason
++ * 0xbab9) with NO backtrace or console captured anywhere — no UART, no fbcon
++ * dump, no RAM dump artifacts. The ramoops reserved-memory zone at
++ * 0x95200000 (4 MiB: console 2 MiB then pmsg 2 MiB, DT node ramoops@95200000)
++ * survives resets and is exposed by Android as /sys/fs/pstore/console-ramoops-0
++ * (ABL console) and /sys/fs/pstore/pmsg-ramoops-0 (the proven marker/diag
++ * readback channel). Writing the panic output there makes the next Android
++ * boot hand us the backtrace.
++ *
++ * Format is Linux fs/pstore/ram_core.c persistent_ram semantics, no ECC (the
++ * DT node carries no ecc-size):
++ *   struct persistent_ram_buffer { u32 sig; u32 start; u32 size; u8 data[]; }
++ *   sig   = 0x43474244 ('DBGC' = PERSISTENT_RAM_SIG ^ per-zone sig(0))
++ *   start = ring offset of the oldest valid byte, start <= buffer_size
++ *   size  = valid byte count, size <= buffer_size
++ *   data  = ring at zone offset 12; buffer_size = zone_size - 12
++ * The console-zone append mirrors persistent_ram_write() exactly so Linux
++ * linearizes our bytes into console-ramoops-0 right after ABL's log.
++ *
++ * Boot args (PE boot args, 0118/0121 gate discipline):
++ *   lagunapanicdump=<0|1>  default ON (1). 0 disables the mapping AND the
++ *                          panic-time writes entirely.
++ *   lagunapanictest=<sec>  default 0 (off). >0 arms a kernel thread that
++ *                          panics after <sec> seconds — the QEMU validation
++ *                          needle.
++ *   lagunalogdump=<0|1>    default ON (1). 0 disables only the additive
++ *                          XNU-MSGBUF v1 mirror and LGLW breadcrumbs; the
++ *                          0123/0124 panic capture remains independent.
++ *
++ * The panic-time writer is minimal and fault-guarded: no allocation, no
++ * locks, no printf, every access bounds-checked against the mapped zone,
++ * data written BEFORE the header (a fault mid-write leaves the header
++ * untouched, i.e. the old consistent state Linux already knows about).
++ */
++#ifndef _ARM64_LAGUNA_PANICDUMP_H_
++#define _ARM64_LAGUNA_PANICDUMP_H_
++
++#include <stddef.h>
++#include <stdint.h>
++#include <sys/cdefs.h>                 /* __unused (stub path) */
++
++#ifndef LAGUNA_PANICDUMP_HOSTTEST
++#include <mach/mach_types.h>           /* vm_size_t (kernel builds) */
++#else
++#include <stdint.h>                    /* host: vm_size_t = uint64_t */
++typedef uint64_t vm_size_t;
++#endif
++
++__BEGIN_DECLS
++
++/*
++ * Late arm_init hook: parse boot args, map the ramoops zone (Device memory —
++ * the physmap window does NOT cover the low bank on either the device, whose
++ * declared-clean bank is 0x8_80000000+, or the 256 MiB QEMU contract that
++ * ends at 0x90000000, so phystokv() must not be used here), validate the
++ * persistent_ram header, and arm the lagunapanictest thread.
++ */
++void laguna_panicdump_init(void);
++
++/* R4 always-on msgbuf mirror. early_init runs immediately after arm_vm_init,
++ * before serial_init; late_init only logs/retries after kprintf is ready. */
++void laguna_logdump_early_init(void);
++void laguna_logdump_late_init(void);
++
++/* Called from log_putc_locked after the source ring accepts a byte. The caller
++ * already holds the BSD log lock; this path allocates and locks nothing. */
++void laguna_logdump_putc(char c, uint32_t bufx);
++
++/* Refresh source metadata and seq. Reason flags are cumulative in the record;
++ * zero is the ordinary startup/periodic refresh. */
++#define LAGUNA_LOGDUMP_FLUSH_PANIC (1u << 1)
++#define LAGUNA_LOGDUMP_FLUSH_HALT  (1u << 2)
++void laguna_logdump_flush(uint32_t reason);
++
++/*
++ * Panic-path hook, called from SavePanicInfo (osfmk/arm/model_dep.c) after
++ * paniclog_flush() — the paniclog text (panic string + all backtraces) is
++ * complete in [paniclog, paniclog + paniclog_len) at that point. Appends the
++ * record into the console zone and writes the pmsg mirror. Safe to call when
++ * init never ran (no-ops).
++ */
++void laguna_panicdump_capture(const char *msg, const char *paniclog,
++    vm_size_t paniclog_len);
++
++/* 0125-class fixed-PA last-words stage writer.  The stage/producer/flag values
++ * and detail ABI are in <arm64/laguna_lastwords.h>.  Returns 0 when disabled,
++ * a positive sequence on commit, or a negative writer error.  Notes must be
++ * static bounded text (or a trusted kernel path), never a panic string. */
++long laguna_panicdump_stage(uint32_t stage, uint32_t producer, uint32_t flags,
++    uint64_t detail0, uint64_t detail1, uint64_t detail2, uint64_t detail3,
++    const char *note);
++
++/*
++ * Late-IOKit hook, called from AppleKeyStore::start (the first laguna IOKit
++ * driver — the earliest fully-threaded point on every delivery path):
++ * spawns the lagunapanictest panic needle (kernel threads are not runnable
++ * during arm_init — spawning there wedges the boot).
++ */
++void laguna_panicdump_bootdone(void);
++
++__END_DECLS
++
++#endif /* _ARM64_LAGUNA_PANICDUMP_H_ */
+--- /dev/null
++++ b/osfmk/arm64/laguna_lastwords.h
+@@ -0,0 +1,265 @@
++/* LAGUNA LAST WORDS v1 — fixed-PA, crash-consistent boot-stage records.
++ *
++ * Canonical producer/reader contract: research/laguna-ramdump/producer/STAMPS.md.
++ * Freestanding-safe: stdint.h only, no allocation, no locks, no libc calls.
++ * All stored fields are little-endian (laguna and the host tests are LE).
++ *
++ * Physical layout in the reserved ramoops pmsg aperture:
++ *   slot 0  PA 0x95401100, slot 1  PA 0x95401180, 128 bytes each.
++ * This pmsg+0x1100..0x11ff window is after MARKER-SCRATCH (+0x1000),
++ * its boot counter (+0x1040), and DIAG's wrap counter (+0x1080), and before
++ * DIAG's records (+0x2000).  It never touches the persistent_ram header.
++ *
++ * The writer alternates slots.  It invalidates the target's commit word,
++ * writes data + CRC with commit=0, cleans to the PoC, then commits the final
++ * word last.  The other slot remains the last complete record after a torn
++ * update.  Sequence numbers do not wrap: implausible/erased values are
++ * ignored, and exhaustion invalidates both slots before restarting at 1.
++ */
++#ifndef LAGUNA_LASTWORDS_H
++#define LAGUNA_LASTWORDS_H
++
++#include <stdint.h>
++
++#define LW_PMSG_BASE       0x95400000ULL
++#define LW_RECORDS_PA      0x95401100ULL
++#define LW_RECORD_SIZE     128u
++#define LW_SLOT_COUNT      2u
++#define LW_WINDOW_SIZE     (LW_RECORD_SIZE * LW_SLOT_COUNT)
++#define LW_SLOT_STRIDE     LW_RECORD_SIZE
++#define LW_SLOT_PA(slot)   (LW_RECORDS_PA + (uint64_t)(slot) * LW_SLOT_STRIDE)
++
++#define LW_MAGIC           0x574c474cu /* bytes "LGLW" */
++#define LW_COMMIT          0x454e4f44u /* bytes "DONE"; written last */
++#define LW_VERSION         1u
++#define LW_SEQ_MAX         0xfffffffdu /* 0 and 0xfffffffe/ffffffff are erased */
++#define LW_CRC_LEN         120u        /* bytes [0,120): excludes crc+commit */
++#define LW_NOTE_SIZE       64u
++
++/* Stage values are durable ABI.  ABL_SEEN is reserved for an earlier-stage
++ * producer; this Linux/XNU ladder does not emit it retroactively. */
++#define LW_STAGE_ABL_SEEN          1u
++#define LW_STAGE_KERNEL_UP         2u
++#define LW_STAGE_PROBE_START       3u
++#define LW_STAGE_ROOT_STAGED       4u
++#define LW_STAGE_KEXEC_DONE        5u
++#define LW_STAGE_XNU_ENTRY         6u
++#define LW_STAGE_XNU_INIT          7u
++#define LW_STAGE_ROOT_MOUNTED      8u
++#define LW_STAGE_LAUNCHD_EXEC      9u
++#define LW_STAGE_DYLD_STAGE       10u
++#define LW_STAGE_DYLD_SHARED_REGION 11u
++#define LW_STAGE_PANIC            12u
++
++#define LW_PRODUCER_ABL            1u /* reserved; not emitted by this lane */
++#define LW_PRODUCER_LINUX_PROBE    2u
++#define LW_PRODUCER_KEXEC_LOADER   3u
++#define LW_PRODUCER_XNU_STUB       4u
++#define LW_PRODUCER_XNU_KERNEL     5u
++#define LW_PRODUCER_XNU_PANIC      6u
++
++#define LW_FLAG_ATTEMPT            (1u << 0) /* entered, not completed */
++#define LW_FLAG_FAILURE            (1u << 1) /* failure/panic context */
++
++struct lw_record {
++	uint32_t magic;          /* +0x00 LW_MAGIC */
++	uint16_t version;        /* +0x04 LW_VERSION */
++	uint16_t bytes;          /* +0x06 LW_RECORD_SIZE */
++	uint32_t seq;            /* +0x08 1-based, non-wrapping */
++	uint32_t stage;          /* +0x0c LW_STAGE_* */
++	uint32_t producer;       /* +0x10 LW_PRODUCER_* */
++	uint32_t flags;          /* +0x14 LW_FLAG_* */
++	uint64_t detail[4];      /* +0x18 stage-specific, zero when unused */
++	char note[LW_NOTE_SIZE]; /* +0x38 NUL-padded ASCII; may be empty */
++	uint32_t crc;            /* +0x78 CRC-32/IEEE of bytes [0,120) */
++	uint32_t commit;         /* +0x7c LW_COMMIT, committed last */
++};
++
++_Static_assert(sizeof(struct lw_record) == LW_RECORD_SIZE,
++	       "LGLW record must be exactly 128 bytes");
++_Static_assert(__builtin_offsetof(struct lw_record, detail) == 0x18,
++	       "LGLW detail ABI");
++_Static_assert(__builtin_offsetof(struct lw_record, note) == 0x38,
++	       "LGLW note ABI");
++_Static_assert(__builtin_offsetof(struct lw_record, crc) == LW_CRC_LEN,
++	       "LGLW CRC ABI");
++_Static_assert(LW_RECORDS_PA >= LW_PMSG_BASE + 0x1084 &&
++	       LW_RECORDS_PA + LW_WINDOW_SIZE <= LW_PMSG_BASE + 0x2000,
++	       "LGLW window must be clear of scratch/counters and DIAG records");
++_Static_assert(LW_RECORDS_PA + LW_WINDOW_SIZE <= LW_PMSG_BASE + 0x200000,
++	       "LGLW window must remain inside pmsg");
++
++/* Memory backend.  read/write return 0 on success, negative on failure.
++ * clean(pa,len) must make the written range visible at the Point of
++ * Coherency and execute the required completion barrier before returning.
++ * Linux uses DC CVAC + DSB SY on its /dev/mem mapping; XNU's Device-memory
++ * mapping needs only DSB SY.  The host mock records this ordering. */
++struct lw_mem {
++	void *ctx;
++	long (*read)(void *ctx, uint64_t pa, void *buf, uint32_t len);
++	long (*write)(void *ctx, uint64_t pa, const void *buf, uint32_t len);
++	long (*clean)(void *ctx, uint64_t pa, uint32_t len);
++};
++
++struct lw_event {
++	uint32_t stage;
++	uint32_t producer;
++	uint32_t flags;
++	uint64_t detail[4];
++	const char *note; /* optional; bounded to 63 chars + NUL */
++};
++
++static inline uint32_t
++lw_crc32(const uint8_t *p, uint32_t n)
++{
++	uint32_t c = 0xffffffffu;
++	uint32_t i;
++	int b;
++
++	for (i = 0; i < n; i++) {
++		c ^= p[i];
++		for (b = 0; b < 8; b++)
++			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
++	}
++	return ~c;
++}
++
++static inline int
++lw_valid(const struct lw_record *r)
++{
++	if (!r || r->magic != LW_MAGIC || r->version != LW_VERSION ||
++	    r->bytes != LW_RECORD_SIZE || r->seq == 0 ||
++	    r->seq > LW_SEQ_MAX || r->stage == 0 || r->producer == 0 ||
++	    r->commit != LW_COMMIT)
++		return 0;
++	return r->crc == lw_crc32((const uint8_t *)r, LW_CRC_LEN);
++}
++
++static inline uint32_t
++lw_sanitize_seq(uint32_t seq)
++{
++	return seq == 0 || seq > LW_SEQ_MAX ? 0 : seq;
++}
++
++static inline void
++lw_encode(struct lw_record *r, uint32_t seq, const struct lw_event *event)
++{
++	uint32_t i, j;
++
++	for (i = 0; i < LW_RECORD_SIZE; i++)
++		((uint8_t *)r)[i] = 0;
++	r->magic = LW_MAGIC;
++	r->version = LW_VERSION;
++	r->bytes = LW_RECORD_SIZE;
++	r->seq = seq;
++	r->stage = event->stage;
++	r->producer = event->producer;
++	r->flags = event->flags;
++	for (i = 0; i < 4; i++)
++		r->detail[i] = event->detail[i];
++	if (event->note) {
++		/* Keep the final byte NUL.  Notes are static producer text or a
++		 * trusted kernel path, never an unchecked panic pointer. */
++		for (i = 0; i + 1 < LW_NOTE_SIZE && event->note[i]; i++)
++			r->note[i] = event->note[i];
++	}
++	/* Make padding deterministic even if a future compiler/store path
++	 * changes note handling. */
++	for (j = i; j < LW_NOTE_SIZE; j++)
++		r->note[j] = 0;
++	r->crc = lw_crc32((const uint8_t *)r, LW_CRC_LEN);
++	r->commit = 0;
++}
++
++/* Commit one event.  Error returns are negative and no success is logged by
++ * this layer.  A failed update can invalidate the selected older slot, but
++ * never the other slot (except the practically unreachable seq-exhaustion
++ * reset, which deliberately invalidates both). */
++static inline long
++lw_write(const struct lw_mem *mem, const struct lw_event *event)
++{
++	struct lw_record rec;
++	uint32_t seq[LW_SLOT_COUNT] = {0, 0};
++	uint32_t newest = 0, next, slot, zero = 0, commit = LW_COMMIT;
++	uint64_t pa;
++	long rc;
++
++	if (!mem || !mem->read || !mem->write || !mem->clean || !event)
++		return -1;
++	if (!event->stage || !event->producer)
++		return -2;
++	for (slot = 0; slot < LW_SLOT_COUNT; slot++) {
++		rc = mem->read(mem->ctx, LW_SLOT_PA(slot) +
++		    __builtin_offsetof(struct lw_record, seq), &seq[slot], 4);
++		if (rc < 0)
++			return -3;
++		seq[slot] = lw_sanitize_seq(seq[slot]);
++		if (seq[slot] > newest)
++			newest = seq[slot];
++	}
++	next = newest == LW_SEQ_MAX ? 1 : newest + 1;
++	slot = (next - 1) % LW_SLOT_COUNT;
++
++	/* Exhaustion is a deliberate generation reset, not a wrapped sequence. */
++	if (newest == LW_SEQ_MAX) {
++		uint32_t i;
++		for (i = 0; i < LW_SLOT_COUNT; i++) {
++			pa = LW_SLOT_PA(i) + __builtin_offsetof(struct lw_record, commit);
++			if (mem->write(mem->ctx, pa, &zero, 4) < 0)
++				return -4;
++			if (mem->clean(mem->ctx, pa, 4) < 0)
++				return -5;
++		}
++	}
++
++	pa = LW_SLOT_PA(slot) + __builtin_offsetof(struct lw_record, commit);
++	if (mem->write(mem->ctx, pa, &zero, 4) < 0)
++		return -6;
++	if (mem->clean(mem->ctx, pa, 4) < 0)
++		return -7;
++
++	lw_encode(&rec, next, event);
++	pa = LW_SLOT_PA(slot);
++	if (mem->write(mem->ctx, pa, &rec, LW_RECORD_SIZE) < 0)
++		return -8;
++	if (mem->clean(mem->ctx, pa, LW_RECORD_SIZE) < 0)
++		return -9;
++
++	pa += __builtin_offsetof(struct lw_record, commit);
++	if (mem->write(mem->ctx, pa, &commit, 4) < 0)
++		return -10;
++	if (mem->clean(mem->ctx, pa, 4) < 0)
++		return -11;
++	return (long)next;
++}
++
++/* Reference read-side primitive for host tests and small producers.  Returns
++ * 1 with the highest valid sequence, 0 when neither slot is valid, or a
++ * negative error only when neither slot could be read.  Invalid/CRC-bad
++ * records are never selected.  R2 owns the full RAM-dump scanner/decoder. */
++static inline long
++lw_read_latest(const struct lw_mem *mem, struct lw_record *out)
++{
++	struct lw_record candidate;
++	uint32_t slot;
++	int have = 0, read_errors = 0;
++
++	if (!mem || !mem->read || !out)
++		return -1;
++	for (slot = 0; slot < LW_SLOT_COUNT; slot++) {
++		if (mem->read(mem->ctx, LW_SLOT_PA(slot), &candidate,
++		    LW_RECORD_SIZE) < 0) {
++			read_errors++;
++			continue;
++		}
++		if (lw_valid(&candidate) && (!have || candidate.seq > out->seq)) {
++			*out = candidate;
++			have = 1;
++		}
++	}
++	if (have)
++		return 1;
++	return read_errors == LW_SLOT_COUNT ? -2 : 0;
++}
++
++#endif /* LAGUNA_LASTWORDS_H */
+--- /dev/null
++++ b/osfmk/arm64/laguna_entry_lastwords.s
+@@ -0,0 +1,211 @@
++/* R4 gated XNU_ENTRY LGLW writer — position-independent AArch64.
++ *
++ * Called by start_first_cpu after patch-xnu-marker.py has performed the XNH0
++ * handoff, but before MMU/caches are enabled. x0 is final boot_args PA (or the
++ * original direct-shim value). The old marker supplies the true incoming x0.
++ *
++ * lagunalogdump defaults ON. A complete, token-bound lagunalogdump=0 argument
++ * suppresses this record; C-side mirror/stages use the same gate. The command
++ * line scan is bounded to boot_args.CommandLine[608] at offset 108.
++ *
++ * Record ABI is exactly research/laguna-ramdump/producer/STAMPS.md: alternating
++ * 128-byte LGLW slots, CRC-32/IEEE over [0,120), DONE committed last. Physical
++ * stores + DSB SY make the record visible to a warm-reset raw RAM dump.
++ * Clobbers x9..x17 and flags; x0 is restored to final boot_args, x1..x8/lr
++ * are preserved. No stack, MMU, caches, C runtime, or external data is used.
++ */
++#include <arm64/asm.h>
++
++.equ LW_SLOT0,        0x95401100
++.equ LW_SLOT1,        0x95401180
++.equ MARKER_SLOT,     0x95400100
++.equ MARKER_MAGIC,    0x5a5a5a5a
++/* XNU-MSGBUF v2: the compact trail moved out of the empirically hostile low
++ * pmsg region (TEE fastboot-re-entry log + handoff page + probe log cover
++ * +0x000..~0x5C80 on every retrieved dump). pmsg+0x28000 is remnant-quiet.
++ * The CRC/DONE LGLW slots stay at the frozen R3-shared ABI (0x95401100/80). */
++.equ COMPACT_SLOT,    0x95428000
++.equ COMPACT_WORDS,   12
++.equ LGLW_MAGIC,      0x574c474c
++.equ LW_COMMIT,       0x454e4f44
++.equ LW_VERSION_SIZE, 0x00800001       /* version=1, bytes=128 */
++.equ LW_STAGE,        6                /* XNU_ENTRY */
++.equ LW_PRODUCER,     4                /* XNU_STUB */
++.equ BA_COMMANDLINE,  108
++.equ BOOT_LINE_LENGTH,608
++.equ DISABLE_LEN,     15               /* "lagunalogdump=0" */
++
++.text
++.balign 8
++.globl EXT(laguna_logdump_entry)
++LEXT(laguna_logdump_entry)
++	mov     x13, x0                   /* final boot_args PA */
++
++	/* Recover the true incoming x0 from the already-executed old marker. */
++	movz    x17, #(MARKER_SLOT & 0xffff)
++	movk    x17, #((MARKER_SLOT >> 16) & 0xffff), lsl #16
++	ldr     w16, [x17]
++	movz    w15, #(MARKER_MAGIC & 0xffff)
++	movk    w15, #((MARKER_MAGIC >> 16) & 0xffff), lsl #16
++	cmp     w16, w15
++	b.ne    1f
++	ldr     x14, [x17, #8]
++	b       2f
++1:
++	mov     x14, x13                  /* unpatched/direct entry: same x0 */
++2:
++
++	/* Clear only the 48-byte compact trail at its v2 location, preserving
++	 * M1/boot/DIAG counters (and the relocated v2 counters, which persist
++	 * across boots). Disabled boots therefore cannot leak a prior boot's
++	 * compact stage. */
++	movz    x15, #(COMPACT_SLOT & 0xffff)
++	movk    x15, #((COMPACT_SLOT >> 16) & 0xffff), lsl #16
++	mov     w16, #(COMPACT_WORDS / 2)
++Llaguna_ld_clear_compact:
++	str     xzr, [x15], #8
++	subs    w16, w16, #1
++	b.ne    Llaguna_ld_clear_compact
++	dsb     sy
++
++	/* Gate the earliest stamp. No boot_args means the default (ON). */
++	cbz     x13, Llaguna_ld_gate_done
++	add     x9, x13, #BA_COMMANDLINE
++	mov     x17, x9                   /* command-line base */
++	add     x10, x9, #(BOOT_LINE_LENGTH - DISABLE_LEN)
++Llaguna_ld_find_disable:
++	ldrb    w11, [x9]
++	cmp     w11, #'l'
++	b.ne    Llaguna_ld_next
++	cmp     x9, x17
++	b.eq    Llaguna_ld_candidate
++	ldrb    w11, [x9, #-1]
++	cmp     w11, #' '
++	b.ne    Llaguna_ld_next
++Llaguna_ld_candidate:
++	mov     x12, x9
++	adr     x15, Llaguna_ld_disable_token
++Llaguna_ld_compare:
++	ldrb    w16, [x15], #1
++	cbz     w16, Llaguna_ld_token_tail
++	ldrb    w11, [x12], #1
++	cmp     w11, w16
++	b.ne    Llaguna_ld_next
++	b       Llaguna_ld_compare
++Llaguna_ld_token_tail:
++	/* Require a token boundary without reading past CommandLine[608]. */
++	add     x16, x17, #BOOT_LINE_LENGTH
++	cmp     x12, x16
++	b.eq    Llaguna_ld_disabled
++	ldrb    w16, [x12]
++	cbz     w16, Llaguna_ld_disabled
++	cmp     w16, #' '
++	b.eq    Llaguna_ld_disabled
++Llaguna_ld_next:
++	add     x9, x9, #1
++	cmp     x9, x10
++	b.ls    Llaguna_ld_find_disable
++Llaguna_ld_gate_done:
++
++	movz    x9, #(LW_SLOT0 & 0xffff)
++	movk    x9, #((LW_SLOT0 >> 16) & 0xffff), lsl #16
++
++	/* Sanitize both seq words: [0,0xfffffffd] only. */
++	ldr     w10, [x9, #8]
++	ldr     w11, [x9, #0x88]
++	movn    w15, #1                   /* 0xfffffffe */
++	cmp     w10, w15
++	csel    w10, wzr, w10, hs
++	cmp     w11, w15
++	csel    w11, wzr, w11, hs
++	cmp     w10, w11
++	csel    w12, w10, w11, hi
++
++	movn    w15, #2                   /* 0xfffffffd = sequence limit */
++	cmp     w12, w15
++	b.eq    Llaguna_ld_generation_reset
++	add     w12, w12, #1
++	mov     x10, x9                   /* odd next -> slot 0 */
++	tbz     w12, #0, Llaguna_ld_select_slot1
++	b       Llaguna_ld_slot_selected
++Llaguna_ld_select_slot1:
++	add     x10, x9, #(LW_SLOT1 - LW_SLOT0)
++	b       Llaguna_ld_slot_selected
++
++Llaguna_ld_generation_reset:
++	str     wzr, [x9, #0x7c]
++	str     wzr, [x9, #0xfc]
++	dsb     sy
++	mov     w12, #1
++	mov     x10, x9
++
++Llaguna_ld_slot_selected:
++	/* Invalidate first; the other slot survives any torn update. */
++	str     wzr, [x10, #0x7c]
++	dsb     sy
++	mov     x15, x10
++	mov     w16, #16
++Llaguna_ld_zero_record:
++	str     xzr, [x15], #8
++	subs    w16, w16, #1
++	b.ne    Llaguna_ld_zero_record
++
++	movz    w15, #(LGLW_MAGIC & 0xffff)
++	movk    w15, #((LGLW_MAGIC >> 16) & 0xffff), lsl #16
++	str     w15, [x10, #0x00]
++	movz    w15, #(LW_VERSION_SIZE & 0xffff)
++	movk    w15, #((LW_VERSION_SIZE >> 16) & 0xffff), lsl #16
++	str     w15, [x10, #0x04]
++	str     w12, [x10, #0x08]
++	mov     w15, #LW_STAGE
++	str     w15, [x10, #0x0c]
++	mov     w15, #LW_PRODUCER
++	str     w15, [x10, #0x10]
++	str     x14, [x10, #0x18]         /* incoming x0 */
++	str     x13, [x10, #0x20]         /* final boot_args PA */
++
++	/* CRC-32/IEEE bytes [0,120), two table-driven nibbles per byte. */
++	movn    w12, #0
++	adr     x15, Llaguna_ld_crc_nibble_table
++	mov     x16, x10
++	add     x17, x10, #120
++Llaguna_ld_crc_loop:
++	ldrb    w11, [x16], #1
++	eor     w12, w12, w11
++	and     w11, w12, #0xf
++	ldr     w11, [x15, w11, uxtw #2]
++	eor     w12, w11, w12, lsr #4
++	and     w11, w12, #0xf
++	ldr     w11, [x15, w11, uxtw #2]
++	eor     w12, w11, w12, lsr #4
++	cmp     x16, x17
++	b.ne    Llaguna_ld_crc_loop
++	mvn     w12, w12
++	str     w12, [x10, #0x78]
++	dsb     sy
++
++	movz    w15, #(LW_COMMIT & 0xffff)
++	movk    w15, #((LW_COMMIT >> 16) & 0xffff), lsl #16
++	str     w15, [x10, #0x7c]
++	dsb     sy
++
++	/* Independent compact breadcrumb at pmsg+0x28000, R3 stage XNU_ENTRY. */
++	movz    x15, #(COMPACT_SLOT & 0xffff)
++	movk    x15, #((COMPACT_SLOT >> 16) & 0xffff), lsl #16
++	mov     w16, #LW_STAGE
++	str     w16, [x15]
++	dsb     sy
++Llaguna_ld_disabled:
++	mov     x0, x13                   /* preserve final boot_args for start.s */
++	ret
++
++.balign 4
++Llaguna_ld_disable_token:
++	.asciz  "lagunalogdump=0"
++
++.balign 8
++Llaguna_ld_crc_nibble_table:
++	.word   0x00000000, 0x1db71064, 0x3b6e20c8, 0x26d930ac
++	.word   0x76dc4190, 0x6b6b51f4, 0x4db26158, 0x5005713c
++	.word   0xedb88320, 0xf00f9344, 0xd6d6a3e8, 0xcb61b38c
++	.word   0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c
