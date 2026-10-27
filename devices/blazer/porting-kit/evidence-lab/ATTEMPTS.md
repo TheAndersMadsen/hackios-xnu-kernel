@@ -140,7 +140,81 @@ read-ramdump.py against the surviving dumps (outputs reproduced exactly).
   missing layer is MBA-syscon (0x5250000) bring-up / ABL MBA quiesce — NOT the
   LPCM payload (wire audit already agrees with CPM-FIRST-SPEC §3.1 + DT).
 
+## v39–v51 — the EP0-determinism + payload-admission campaign (2026-10-27 09:45–10:40)
+
+These thirteen attempts took the lane from "EP0 enumerated once" to "XNU
+boots on the phone". The script's outcome class for all of them is
+`ep0-live` (the console stayed up, so no park happened during the watch
+window), which is why the table rows look uniform — the real verdicts below
+come from the dumps, which were pulled **late** (after the shim's terminal
+reset or XNU's own panic reset parked the phone) and decoded afterwards
+(`late-kernel.log` + regenerated `stamps-decode.txt`; the v51 dir carries
+`reader-full.txt`). Full analysis: [`../evidence-channels/PAYLOAD-ADMISSION.md`](../evidence-channels/PAYLOAD-ADMISSION.md).
+
+- **v39 (09:45, sha `6fee0c6f47f0dab5`)** — **EP0 first full enumeration +
+  first transfer-active refusal.** Warm world: `usb-warm DONE 0x33313130`
+  (GSNPSID), preflight PASS, `dma-admit DONE`, `ep0-ready DONE 0x820009`,
+  8 s enumeration wait DONE (console live), then `payload-admit ENTER
+  0x8a000000` and the handoff-time check refused — the old
+  `state != EP0_SETUP` predicate treats the host-connected endpoint (parked
+  in a wait-status) as busy. The refusal path re-entered the USB wait and
+  died at `usb-enum-wait FAULT 0x0` (seq 33).
+- **v40–v44 (09:51–10:08, shas `2c6822462e7fc090`, `732838a6f184402a`,
+  `65d450fc7cca1d27`, `c91aec537d612442`, `ceb6ea419363be3d`)** — **EP0
+  stamps + wait/WDT forensics.** Per-request EP0 breadcrumbs land
+  (`usb-enum-wait ENTER type<<16|req<<8|len` / `DONE 0x8000|n`): the dumps
+  show the host polling loop as `0xc05a00 ENTER → 0x8180 DONE` pairs (384 B
+  GET_LOG reads). Every attempt still died `FAULT 0x0` **exactly ~9.0 s
+  after the last `wdt-pat`** (e.g. pat@4.4 s → FAULT@13.4 s): the survey
+  finds THREE firmware WDTs but the pat path services two — the unpatted
+  instance bites mid-wait. v44's dump additionally proves the endpoint
+  parks in `WAIT_STATUS3` after the host's last read — the transfer-active
+  predicate, not the USB link, was refusing every handoff.
+- **v45 (10:12, sha `bbbd734f39501ff2`)** — predicate fixed (only a data
+  stage in flight blocks) and the first payload admission attempt: the
+  initrd scan refused `no TEGUXNU payload within scan budget` (stamped
+  `no TEGUX`, seq 75 @29.1 s) — ABL's retained vendor archives push the
+  TEGUXNU magic past the 64 MiB scan budget. Drove the embedded-envelope
+  delivery.
+- **v46/v46b (10:18/10:19, aborted builds — no table rows)** — first
+  envelope build embedded the payload AND still shipped it as the ramdisk:
+  84,480,000 B > the 67,108,864 B AVB partition, so AVB refused pre-boot.
+  v46b switched to the empty cpio (tegu `ramdisk_size = 0` semantics) →
+  42,889,216 B, boots.
+- **v46b boot (10:21, sha `7f8394e35098c28d`)** — envelope found and
+  validated (`payload-admit DONE 0x3/0x4`), window `0x88000000+160M`
+  refused `XNU window overlaps FDT reservation` (stamped `XNU wind`).
+- **v47 (10:27, sha `da10ae8fcfc85291`)** — window experiment
+  `0x97400000+128M` refused `invalid kernel window` (stamped `invalid `):
+  base not 32 MiB-aligned — the alignment gate working as designed.
+- **v48 (10:30, sha `38934b4945b15c18`)** — `0x98000000+112M` refused
+  `insufficient kernel headroom` (stamped `insuffic`): the payload needs
+  92.1 MiB of kernel + 64 MiB headroom = 156.1 MiB minimum.
+- **v49 (10:33, sha `78d3f8d5a6d0da1e`) and v50 (10:37, sha
+  `a80478a83f984ffa`)** — `FDT dynamic pool unresolved` refusals (stamped
+  `FDT dyna`) on `0xA8000000+256M` and then the correct window
+  `0xD0000000+160M`: the stock FDT carries `shared-dma-pool` nodes with no
+  `alloc` property (pkvm_iommu_cma, vframe 532 MiB reusable, vstream) that
+  the old check treated as fixed reservations — refusing EVERY window.
+- **v51 (10:40, sha `9aa84e828405f90a`)** — unresolved pools non-fatal →
+  **ADMISSION PASS on `0xD0000000+0x0A000000`** → segments copied →
+  EL2→EL1 drop → **XNU booted**: VM bootstrap, IOKit, vnguard/AMFI/Sandbox
+  policies, PMRD power ladder, then `%s:%d Assertion failed: %s` panic and
+  `MACH Reboot` (~103 s console time). Mirror v2 (seq 6, 7,642 B) +
+  breadcrumbs `XNU_ENTRY(6) → XNU_INIT(7) → PANIC(12)` + 90 KB console
+  captured via the late pull. **Current blocker = the init assertion after
+  PMRD**; note the stamp page itself is consumed on a successful run (XNU
+  owns the pmsg zone after the jump) — "no TSHIMST magic" on a post-XNU
+  dump is the success signature, not channel loss.
+
 ## Attempt log — one line per attempt (appended by run-attempt.sh)
+
+(For v39+ the script recorded the `ep0-live` outcome class — the console
+stayed up through the watch window, so no park happened while it was
+watching. The dumps were pulled late and decoded afterwards; the decoded
+per-attempt verdicts live in the v39–v51 prose section above, and the
+attempt dirs' `stamps-decode.txt` files were regenerated 2026-10-27 from
+the surviving `late-kernel.log` apertures.)
 
 timestamp | candidate sha | attempt name | EP0? | last-stage | reason | dump path
 2026-10-26T18:37:00 | 988561750fc9307e | v2 | no | usb-dead(no-stamps) | usb-dark | -
@@ -151,3 +225,16 @@ timestamp | candidate sha | attempt name | EP0? | last-stage | reason | dump pat
 2026-10-27T08:52:36 | 746902b9bb91ed89 | v36 | no | ep0-live | usb-console-live | -
 2026-10-27T08:58:48 | 3f2d200c1fbeb2d7 | v37 | no | usb-warm [FAULT]@seq27 | cpm-never-came-up | attempts/20261027-085704-v37/ramdump/kernel.log
 2026-10-27T09:18:18 | cb68de26ed49c2bc | v38 | no | wdt-quiesce-late [DONE]@seq34 | refused | attempts/20261027-091614-v38/ramdump/kernel.log
+2026-10-27T09:45:46 | 6fee0c6f47f0dab5 | v39 | yes | ep0-live | usb-console-live | -
+2026-10-27T09:51:49 | 2c6822462e7fc090 | v40 | yes | ep0-live | usb-console-live | -
+2026-10-27T09:56:05 | 732838a6f184402a | v41 | yes | ep0-live | usb-console-live | -
+2026-10-27T10:00:03 | 65d450fc7cca1d27 | v42 | yes | ep0-live | usb-console-live | -
+2026-10-27T10:03:47 | c91aec537d612442 | v43 | yes | ep0-live | usb-console-live | -
+2026-10-27T10:08:34 | ceb6ea419363be3d | v44 | yes | ep0-live | usb-console-live | -
+2026-10-27T10:12:19 | bbbd734f39501ff2 | v45 | yes | ep0-live | usb-console-live | -
+2026-10-27T10:21:30 | 7f8394e35098c28d | v46b | yes | ep0-live | usb-console-live | -
+2026-10-27T10:27:26 | da10ae8fcfc85291 | v47 | yes | ep0-live | usb-console-live | -
+2026-10-27T10:30:29 | 38934b4945b15c18 | v48 | yes | ep0-live | usb-console-live | -
+2026-10-27T10:33:44 | 78d3f8d5a6d0da1e | v49 | yes | ep0-live | usb-console-live | -
+2026-10-27T10:37:36 | a80478a83f984ffa | v50 | yes | ep0-live | usb-console-live | -
+2026-10-27T10:40:03 | 9aa84e828405f90a | v51 | yes | ep0-live | usb-console-live | -
