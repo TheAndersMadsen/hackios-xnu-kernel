@@ -305,7 +305,133 @@ K4 build fixes) — the delta between v60 and v61 is root content only
   export-trie remap — the residual family pre-documented in
   NDR-RECORD-FIX.md §5 (disk-trie alias semantics / closure loading at
   preferred addresses). Fix lane: F1 → root-v10 (INDIRECT-FIX.md when it
-  lands).
+  lands). **(PROVENANCE CORRECTION 2026-10-28, F1c audit — INDIRECT-FIX.md
+  §5): the shipped root-v9 was later proven byte-identical in CONTENT to
+  root-v8 (199/199 files, 0 differing; all 36 `LC_DYLD_EXPORTS_TRIE` empty,
+  `__TEXT` hollow — N1r's repairs never landed in the pinned image). The
+  v60→v61 wall change is therefore a layout/extent effect (the laguna HFS
+  driver serving different bytes for the same logical content depending on
+  image layout), not content — documented honestly rather than read as an
+  N1r fix confirmation. The repairs only became real in root-v10.**
+
+### Backfill — 2026-10-27 19:13 → 2026-10-28 v63 → v69 (P6, host-only ledger backfill)
+
+Verdicts assembled host-side from the v63 attempt dir (`meta.txt` +
+`reader-full.txt`), the QEMU bridge evidence
+(`qemu-validation/evidence/runC-late-vNNb-nvram/` + pins
+`inputs/tag-vNNb.env`), and the F/D-lane reports (F1b/F1c/F1d/D1/D2/D3/D4).
+The v63 table row below was upgraded in place from the preliminary
+`ep0-live` auto-append (P6/K7 pattern). **v66–v69 were never device-fired**
+— no attempt dir exists, so they carry prose entries here and NO
+attempt-table rows; no device result is claimed for any of them. Their
+evidence is QEMU-only, via F2's bridge payload (exact device kernel bytes +
+ADT swapped), which has reproduced every wall in this class marker-for-marker
+(v60b/v61b/v63b precedents). Context candidates v62/v64/v65 (built, never
+device-fired) are summarized in one bullet each. Every entry shares mach
+`mach.blazer-r4r7-hfs` (`27f05924…`) — only root + dyld content moves.
+
+- **v63 (2026-10-27 19:13:23 device, sha `abd8630281617ab2…`, mach r4r7-hfs
+  `27f05924…`, root-v10 `3af78bcb…` = F1's N1r-pipeline re-run + 554
+  section-field translations + 31 GOT flag flips) — INDIRECT WALL CLEARED
+  ON DEVICE; NEW WALL = launchd SIGSEGV in dyld's NXArgcPtr wire-up.**
+  `indirect symbol has out of range address` appears NOWHERE: the
+  namespace-6 subcode-0x9 closure-validation death is gone. Ladder again
+  10/10 (last=DYLD, dyld=shared-region): `hfs: mounted iOSRoot on device
+  b(1, 0)` @4591.596 s → `/sbin/launchd` exec'd (no execdiag, no errno 8)
+  → shared_region/minisandbox lines @4591.646–650 s → then
+  `usertrap: launchd[1] exception 1 code 0x1 0x201e1d34628: pc 0x100e0e058
+  lr 0x100e0e020 sp 0x16f2eb280, shared cache slide 0x0` @4591.806 s
+  (`called from 0x100e0c2e0` → `0x0`) → `pid 1 exited -- exit reason
+  namespace 2 subcode 0xb` @4591.807 s → `MACH Reboot` @4593.416 s;
+  PANIC(12)@seq1935762623. Symbolication (F1b, byte-proven; F1c symtab
+  refinement): the faulting VA 0x201e1d34628 is an UN-APPLIED dyld
+  chained-fixup REBASE entry (target36 0x1E1D34628, next=2) sitting raw in
+  libdyld `__DATA_DIRTY,__dyld4` +0x18 (`defaultVars.NXArgcPtr`); pc =
+  `dyld4::prepare`+0x9c4 = the `*state.vars->NXArgcPtr = argc` store
+  (dyldMain.cpp:742). QEMU v63b reproduced it marker-for-marker — SAME VA,
+  namespace 2 subcode 0xb, different dyld base (0x10087e…) — one defect,
+  layout-independent. Fix lane: F1b → root-v11 (POINTER-REBASE.md).
+- **v62 (sha `2c27c35dfa06e925…`, mach r4r8-hfs-disp + root-v9) — BUILT +
+  AVB-VERIFIED, NEVER FIRED.** F3's display-mach candidate (K6 DC9x00
+  series 0001–0003 + /laguna-dpu ADT node, `io.display.probe=1
+  io.display.splash=1`). Coordinator chose the root lane first; no device
+  result claimed. Dark-panel-is-success note lives in
+  /tmp/fleet/f3-display-mach-report.md §7.
+- **v64 (sha `6ba42b935c700800…`, root-v11 = F1b's 11,757-pointer rebase +
+  380 sectname repairs) — QEMU-ONLY (v64b, evidence 2026-10-27 19:57).
+  NEGATIVE CONTROL as pre-registered:** same NXArgcPtr instruction faulted
+  at the SAME class of address (dyld base 0x100AE4000, F1c's string-pointer
+  proof) — root-v11's rebased pointers still dangle because the stock
+  extracted dyld maps disk dylibs ANYWHERE and never slides rebase-less
+  splits (wall-#4 root cause, SUBCACHE-POINTERS.md). Never device-fired.
+- **v65 (sha `4193058b2ad521d5…`, root-v13 = v12 disjoint compacted layout
+  + D1's SOURCE-BUILT dyld-1066.8 with the F1c mapSegments preferred-load
+  patch) — QEMU-ONLY (v65b, evidence 2026-10-27 22:40). FIRST patched-dyld
+  boot; NEW WALL = NULL+8 deref:** `usertrap … fault VA 0x8` symbolicated
+  byte-exactly (NULL-DEREF.md) to `_cerror_nocancel`+0x10 — D1's dyld
+  links xnu libsyscall's TLS errno (`_os_tsd_get_direct(__TSD_ERRNO)` at
+  tpidrro+8) with TLS base 0; trigger = the EXPECTED cacheless-boot
+  `shared_region_check_np` = 12 (ENOMEM) error return in start()'s cache
+  probe. Died BEFORE prepare() — preferred-load + NXArgcPtr walls
+  untested in v65b (F1d frontier correction). Never device-fired.
+- **v66 (sha `8c28b4fef52b79b3…`, root-v14 = F1d's TLS-free errno/lock
+  dyld `e0e00473d6b02183…`) — QEMU-ONLY (v66b, evidence 2026-10-27
+  23:35), never device-fired. Wall-#6 cleared, then SYSCALL-STUB LIVELOCK:**
+  `systrace: launchd[1] shared_region_check_np(…, 0x4000, 0x1, 0x0) = 12`
+  @0.600862 s kernel-side with NO NULL+8 usertrap (the F1d errno fix
+  works), then pid 1 goes silent. D2 decoded the parked guest state
+  byte-exactly: dyld alive at EL0 inside the stub's error path — the D1
+  BSDSYS stub macro's `bl _cerror` clobbers the caller's LR (x30 = the
+  stub's OWN `ret`; X16=294; X0:X1=-1:-1 = the cerror return convention;
+  X8=&errno) → `ret` branches to ITSELF = 1-instruction livelock; kernel
+  healthy the whole time (memory-stat loop, no usertrap possible). Fix:
+  D2's 48/48 BSD error-path LR save/restore + munmap 71→73
+  (SYSCALL-STUBS.md) → root-v15.
+- **v67 (sha `d5311d0208d21b02…`, root-v15 = D2 stub-fixed dyld
+  `731bf809729b9dd3…`) — QEMU-ONLY (v67b, evidence 2026-10-28 00:17),
+  never device-fired. STUB FIX CONFIRMED, then SILENT EL0 SPIN:**
+  check_np = 12 @0.620319 s, NO livelock, NO usertrap, scheduler healthy
+  (memory-stat spam to 890 s) — the D2 fix is resident and working; pid 1
+  then hangs with zero console output (no exit, no panic). D3 proved the
+  hang is NOT the F1d constant-owner lock (binary-level audit) and that
+  kernel systrace prints only FAILED syscalls ON RETURN — so
+  blocked-forever / success-loop / pure-EL0-loop are console-
+  indistinguishable (BOOTSTRAP-LOCKS.md). Motivated the D3 boottrace
+  instrument (13 unique-length write(2) markers, decoded by LENGTH, no
+  dyld base needed) → root-v16.
+- **v68 (sha `ec837ca87783532d…`, root-v16 = D3 barrier-lock + boottrace
+  dyld `9057e30b4246de4b…`) — QEMU-ONLY (v68b, evidence 2026-10-28 01:12),
+  never device-fired. FIRST INSTRUMENTED EL0 TRACE:** `write(0x2, …, 0xa)`
+  = M01 @0.619536 s → `write(0x2, …, 0xb)` = M02 (persistent allocator
+  created) @0.622365 s → silence; kernel healthy. D4 windowed the
+  M02→M03 gap from the linked binary: hang inside
+  `lsl::Allocator::aligned_alloc(8, 0x1e8=sizeof(ProcessConfig))` or the
+  ProcessConfig ctor — the assert-free BTree-walk class (every escape
+  hatch in the binary compiles LOUD; the silent spin has no assert).
+  Fix: D4's bounded 16-retry guard + A1/A2/A3 allocator markers
+  (ALLOCATOR-HANG.md) → root-v17.
+- **v69 (sha `530ece467e1afa4d…`, root-v17 = D4 guarded + allocator-marker
+  dyld `7e092f33f86cf102…`) — QEMU-ONLY (v69b, evidence 2026-10-28 01:54),
+  never device-fired. CURRENT FRONTIER — B-TREE WALK SPIN:**
+  M01 (0xa) @0.606356 → A1 (0x17, aligned_alloc entry k=1) → A2 (0x18,
+  guard-loop iteration) ×2 → M02 (0xb, persistent allocator created)
+  @0.609318 → A1 (k=2) → A2 @0.609727 → silence; **zero A3 (0x19) lines**
+  = the no-fit→vm_allocate path never ran → per the pre-registered
+  ALLOCATOR-HANG.md §4 decode table this is W-A2: hang INSIDE the BTree
+  scan on allocation k=2. Kernel healthy throughout (memory-stat spam to
+  890+ s). P1 owns the D5-equivalent fix → root-v18.
+- **D-loop status (v61 → v69):** six walls named/cleared in ~30 h with ONE
+  device boot (v63) — indirect-symbol validation (root-v10, device),
+  NXArgcPtr rebase (root-v11/v12 content + F1c layout), TLS errno/lock
+  (F1d), stub LR livelock (D2), silence (D3 boottrace instrument), and now
+  the allocator BTree walk (D4 guard narrowed it to W-A2). Death moved from
+  kernel exec walls through dyld's bind validation into dyld's OWN heap
+  bootstrap; the boottrace ladder (M/A markers) is now the frontier
+  readout. Every step validated QEMU-first against the F2 bridge
+  (marker-for-marker record: v60b/v61b/v63b); the device is only burned
+  when a wall class changes. Strategic exit from the carve-patch class
+  remains the v3.9 UFS full-root transport (ROOT-TRANSPORT.md /
+  ufs-staging/PLAN.md).
 
 ## Attempt log — one line per attempt (appended by run-attempt.sh)
 
@@ -353,3 +479,4 @@ timestamp | candidate sha | attempt name | EP0? | last-stage | reason | dump pat
 2026-10-27T15:09:50 | 51f3d78d71f403fc | v59 | yes | ROOT-MOUNT→PANIC(12)@seq1935762593 | execdiag-mockfs-steal-fingerprint-confirmed | attempts/20261027-150908-v59/reader-full.txt
 2026-10-27T16:11:43 | f207a5e087f6c9ee | v60 | yes | DYLD→PANIC(12)@seq1935762603 | hfs-root-mounted-launchd-exec-dyld-shared-region-ndr-record-bind-wall | attempts/20261027-161053-v60/reader-full.txt
 2026-10-27T17:34:27 | 22a0ae61355ea622 | v61 | yes | DYLD→PANIC(12)@seq1935762613 | ndr-cleared-map-with-linking-einval-indirect-symbol-out-of-range | attempts/20261027-173349-v61/reader-full.txt
+2026-10-27T19:14:01 | abd8630281617ab2 | v63 | yes | DYLD→PANIC(12)@seq1935762623 | indirect-cleared-launchd-sigsegv-nxargcptr-prepare-namespace2-subcode0xb | attempts/20261027-191323-v63/reader-full.txt
