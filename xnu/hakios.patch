@@ -61,17 +61,36 @@ index a4d25040f38f..aad72993d139 100644
  kern_csr.o_INCFLAGS += -I$(SRCROOT)/osfmk
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index 4b83160780c3..1dfd09346069 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -562,6 +562,13 @@ $(COMPONENT).libfilelist: $(LIBOBJS)
+ 
+ MAKESYSCALLS = $(SRCROOT)/bsd/kern/makesyscalls.sh
+ 
++# Serialize the generated sysent family under parallel make: each mode reads
++# the master and rewrites its output file, so the four generations run one at
++# a time and can never interleave with a concurrent regeneration (see
++# devices/blazer/docs/BUILD.md, "Parallel-build safety"). Only these four
++# targets are serialized; the object compiles below stay parallel.
++.NOTPARALLEL: init_sysent.c syscalls.c audit_kevents.c systrace_args.c
++
+ init_sysent.c: $(TARGET)/bsd.syscalls.master
+ 	@$(LOG_GENERATE) "$@$(Color0) from $(ColorF)$(<F)$(Color0)"
+ 	$(_v)$(MAKESYSCALLS) $< table > /dev/null
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..1e8e59f3fe2b 100644
+index 44274016a4cf..ae54267fbc20 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,43 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,44 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
 +bsd/dev/hakios.input.c		standard
 +bsd/dev/hakios.virtio_input.c	standard
 +bsd/dev/hakios.goodix.c	standard
++bsd/dev/hakios.tcm.c	standard
 +bsd/dev/hakios.buttons.c	standard
 +bsd/dev/hakios.battery.c	standard
 +bsd/dev/hakios.ufs.c	standard
@@ -109,7 +128,7 @@ index 44274016a4cf..1e8e59f3fe2b 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +192,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +193,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -124,7 +143,7 @@ index 44274016a4cf..1e8e59f3fe2b 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +406,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +407,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -132,7 +151,7 @@ index 44274016a4cf..1e8e59f3fe2b 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +429,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +430,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -359,10 +378,22 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..4a6e0ccfc590 100644
+index 4df41ba1f61b..c70c756538b0 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -147,6 +147,13 @@
+@@ -115,6 +115,11 @@
+ 
+ #include <mach/vm_param.h>
+ 
++#if defined(__arm64__)
++#include <arm64/laguna_panicdump.h>
++#include <arm64/laguna_lastwords.h>
++#endif
++
+ #include <vm/vm_map.h>
+ #include <vm/vm_kern.h>
+ 
+@@ -147,6 +152,13 @@
  #include <net/if_ether.h>               /* for ether_family_init() */
  #include <net/if_gif.h>                 /* for gif_init() */
  #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
@@ -376,7 +407,7 @@ index 4df41ba1f61b..4a6e0ccfc590 100644
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +497,7 @@ bsd_init(void)
+@@ -490,7 +502,7 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -385,7 +416,22 @@ index 4df41ba1f61b..4a6e0ccfc590 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +983,14 @@ bsd_init(void)
+@@ -902,6 +914,14 @@ bsd_init(void)
+ 	lck_rw_lock_exclusive(&rootvnode_rw_lock);
+ 	set_rootvnode(init_rootvnode);
+ 	lck_rw_unlock_exclusive(&rootvnode_rw_lock);
++#if defined(__arm64__)
++	/* R4 (laguna mirror port, 0129): vfs_mountroot succeeded and the root
++	 * vnode is fully installed. */
++	(void)laguna_panicdump_stage(LW_STAGE_ROOT_MOUNTED,
++	    LW_PRODUCER_XNU_KERNEL, 0,
++	    (uint64_t)(uint32_t)rootdev, 0, 0, 0,
++	    "vfs_mountroot ok; root vnode installed");
++#endif
+ 	init_rootvnode = NULLVP;  /* use rootvnode after this point */
+ 
+ 
+@@ -976,6 +996,14 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
@@ -414,10 +460,22 @@ index 95192dd62449..b00da803b5b4 100644
  
  	/*
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 1d71c66629fb..1d5025f32b88 100644
+index 1d71c66629fb..ab7a240afccc 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -1157,6 +1157,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
+@@ -81,6 +81,11 @@
+ #include <machine/reg.h>
+ #include <machine/cpu_capabilities.h>
+ 
++#if defined(__arm64__)
++#include <arm64/laguna_panicdump.h>
++#include <arm64/laguna_lastwords.h>
++#endif
++
+ #include <sys/cdefs.h>
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -1157,6 +1162,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
   *		activators should not be given the opportunity to attempt
   *		to activate the image.
   */
@@ -427,7 +485,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  static int
  exec_mach_imgact(struct image_params *imgp)
  {
-@@ -1315,6 +1318,9 @@ grade:
+@@ -1315,6 +1323,9 @@ grade:
  	 * Actually load the image file we previously decided to load.
  	 */
  	lret = load_machfile(imgp, mach_header, thread, &map, &load_result);
@@ -437,7 +495,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  	if (lret != LOAD_SUCCESS) {
  		error = load_return_to_errno(lret);
  
-@@ -2197,6 +2203,9 @@ again:
+@@ -2197,6 +2208,9 @@ again:
  	}
  
  	error = exec_check_permissions(imgp);
@@ -447,7 +505,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  	if (error) {
  		goto bad;
  	}
-@@ -2640,6 +2649,57 @@ done:
+@@ -2640,6 +2654,57 @@ done:
  	return ret;
  }
  
@@ -505,7 +563,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  /*
   * exec_handle_file_actions
   *
-@@ -2709,7 +2769,7 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+@@ -2709,7 +2774,7 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
  			AUDIT_SUBCALL_ENTER(OPEN, p, uthread);
  
  			NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | AUDITVNPATH1, UIO_SYSSPACE,
@@ -514,7 +572,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  			    imgp->ip_vfs_context);
  
  			error = open1(imgp->ip_vfs_context, ndp,
-@@ -3094,10 +3154,16 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
+@@ -3094,10 +3159,16 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
  	int error = 0;
  	struct persona *persona = NULL;
  
@@ -535,7 +593,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  	if (px_persona->pspi_flags & POSIX_SPAWN_PERSONA_GROUPS) {
  		if (px_persona->pspi_ngroups > NGROUPS_MAX) {
  			return EINVAL;
-@@ -3105,12 +3171,6 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
+@@ -3105,12 +3176,6 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
  	}
  
  	persona = persona_lookup(px_persona->pspi_id);
@@ -548,7 +606,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  	if (persona) {
  		persona_put(persona);
  	}
-@@ -3130,9 +3190,6 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
+@@ -3130,9 +3195,6 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
  	 * the kauth with a different UID/GID combo
  	 */
  	persona = persona_lookup(px_persona->pspi_id);
@@ -558,7 +616,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  
  	cred = kauth_cred_proc_ref(p);
  
-@@ -3158,6 +3215,48 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
+@@ -3158,6 +3220,48 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
  		    px_persona->pspi_gmuid);
  	}
  
@@ -607,7 +665,24 @@ index 1d71c66629fb..1d5025f32b88 100644
  	ret = persona_proc_adopt(p, persona, cred);
  
  	kauth_cred_unref(&cred);
-@@ -5586,10 +5685,75 @@ bad:
+@@ -5034,6 +5138,16 @@ __mac_execve(proc_t p, struct __mac_execve_args *uap, int32_t *retval __unused)
+ 	 */
+ 	error = exec_activate_image(imgp);
+ 	/* thread and task ref returned for vfexec case */
++#if defined(__arm64__)
++	if (!error && proc_pid(p) == 1) {
++		/* R4 (laguna mirror port, 0129): image activation succeeded; the
++		 * dynamic linker/user return is next. This deliberately does not
++		 * claim dyld has executed yet. */
++		(void)laguna_panicdump_stage(LW_STAGE_DYLD_STAGE,
++		    LW_PRODUCER_XNU_KERNEL, 0, 0, 0, 0, 0,
++		    "pid1 image active; dyld next");
++	}
++#endif
+ 
+ 	if (imgp->ip_new_thread != NULL) {
+ 		/*
+@@ -5586,10 +5700,75 @@ bad:
   * Note:	The argument and environment vectors are user space pointers
   *		to arrays of user space pointers.
   */
@@ -683,7 +758,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  	int error = 0;
  	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
  	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
-@@ -5759,6 +5923,33 @@ exec_extract_strings(struct image_params *imgp)
+@@ -5759,6 +5938,33 @@ exec_extract_strings(struct image_params *imgp)
  		imgp->ip_envc++;
  	}
  
@@ -717,7 +792,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  	/* Save space for envv[] NULL terminator */
  	if (imgp->ip_argspace < new_ptr_size) {
  		error = E2BIG;
-@@ -6636,7 +6827,23 @@ handle_mac_transition:
+@@ -6636,7 +6842,23 @@ handle_mac_transition:
  	}
  
  	/* Update the process' identity version and set the security token */
@@ -742,7 +817,19 @@ index 1d71c66629fb..1d5025f32b88 100644
  	task_set_uniqueid(task);
  	set_security_token_task_internal(p, task);
  
-@@ -7538,6 +7745,11 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -6846,6 +7068,11 @@ load_init_program_at_path(proc_t p, user_addr_t scratch_addr, const char* path)
+ 	 */
+ 	set_security_token(p);
+ 
++#if defined(__arm64__)
++	/* R4 (laguna mirror port, 0129): the launchd path attempt. */
++	(void)laguna_panicdump_stage(LW_STAGE_LAUNCHD_EXEC,
++	    LW_PRODUCER_XNU_KERNEL, LW_FLAG_ATTEMPT, 0, 0, 0, 0, path);
++#endif
+ 	return execve(p, &init_exec_args, retval);
+ }
+ 
+@@ -7538,6 +7765,11 @@ process_signature(proc_t p, struct image_params *imgp)
  	}
  
  done:
@@ -872,6 +959,116 @@ index 003cfb074a99..c597065f24f1 100644
  
  	if (sock == NULL) {
  		return EINVAL;
+diff --git a/bsd/kern/makesyscalls.sh b/bsd/kern/makesyscalls.sh
+index 52992d4cd0af..f2439236aba7 100755
+--- a/bsd/kern/makesyscalls.sh
++++ b/bsd/kern/makesyscalls.sh
+@@ -65,8 +65,16 @@ tracecodetempfile="tracecodetempfile.$$"
+ systraceargstempfile="systraceargstempfile.$$"
+ systraceargdesctempfile="systraceargdesctempfile.$$"
+ systracerettempfile="systracerettempfile.$$"
++# per-pid staging names for the final outputs (renamed into place atomically)
++finalsyscalltablefile="$syscalltablefile.$$"
++finalsyscallnamesfile="$syscallnamesfile.$$"
++finalsysprotofile="$sysprotofile.$$"
++finalsyshdrfile="$syshdrfile.$$"
++finalauditevfile="$auditevfile.$$"
++finalsystraceargsfile="$systraceargsfile.$$"
++finaltracecodename="$tracecodename.$$"
+ 
+-trap "rm $syslegal $sysent $sysinc $sysarg $sysprotoend $syscallnamestempfile $syshdrtempfile $audittempfile $tracecodetempfile $systraceargstempfile $systraceargdesctempfile $systracerettempfile" 0
++trap "rm -f $syslegal $sysent $sysinc $sysarg $sysprotoend $syscallnamestempfile $syshdrtempfile $audittempfile $tracecodetempfile $systraceargstempfile $systraceargdesctempfile $systracerettempfile $finalsyscalltablefile $finalsyscallnamesfile $finalsysprotofile $finalsyshdrfile $finalauditevfile $finalsystraceargsfile $finaltracecodename" 0
+ 
+ touch $syslegal $sysent $sysinc $sysarg $sysprotoend $syscallnamestempfile $syshdrtempfile $audittempfile $tracecodetempfile $systraceargstempfile $systraceargdesctempfile $systracerettempfile
+ 
+@@ -789,38 +797,48 @@ s/\$//g
+ 		printf "\tdefault:\n\t\tbreak;\n\t};\n\tif (p != NULL)\n\t\tstrlcpy(desc, p, descsz);\n}\n" > systracerettempfile
+ 	} '
+ 
++# Final outputs go to per-pid temps and are renamed into place: a reader under
++# parallel make (a compile job including sysproto.h, or a second make sharing
++# the BUILD tree) must see either the previous complete file or the new one,
++# never a truncated/partial one (see "Parallel-build safety" in the README).
++# The $$ temps join the trap cleanup above, so a killed run leaves no litter.
+ if [ $output_syscalltablefile -eq 1 ]; then
+-    cat $syslegal > $syscalltablefile
+-    cat $sysinc $sysent >> $syscalltablefile
++    cat $syslegal $sysinc $sysent > $finalsyscalltablefile
++    mv -f $finalsyscalltablefile $syscalltablefile
+ fi
+ 
+ if [ $output_syscallnamesfile -eq 1 ]; then
+-    cat $syslegal $syscallnamestempfile > $syscallnamesfile
++    cat $syslegal $syscallnamestempfile > $finalsyscallnamesfile
++    mv -f $finalsyscallnamesfile $syscallnamesfile
+ fi
+ 
+ if [ $output_sysprotofile -eq 1 ]; then
+-    cat $syslegal $sysarg $sysprotoend > $sysprotofile
++    cat $syslegal $sysarg $sysprotoend > $finalsysprotofile
++    mv -f $finalsysprotofile $sysprotofile
+ fi
+ 
+ if [ $output_syshdrfile -eq 1 ]; then
+-    cat $syslegal $syshdrtempfile > $syshdrfile
++    cat $syslegal $syshdrtempfile > $finalsyshdrfile
++    mv -f $finalsyshdrfile $syshdrfile
+ fi
+ 
+ if [ $output_auditevfile -eq 1 ]; then
+-    cat $syslegal $audittempfile > $auditevfile
++    cat $syslegal $audittempfile > $finalauditevfile
++    mv -f $finalauditevfile $auditevfile
+ fi
+ 
+ if [ $output_systrace -eq 1 ]; then
+-	cat $systraceargstempfile > $systraceargsfile
+-	cat $systraceargdesctempfile >> $systraceargsfile
+-	cat $systracerettempfile >> $systraceargsfile
++	cat $systraceargstempfile $systraceargdesctempfile \
++	    $systracerettempfile > $finalsystraceargsfile
++	mv -f $finalsystraceargsfile $systraceargsfile
+ fi
+ 
+ if [ $output_tracecodes -eq 1 ]; then
+ 	if [ $use_stdout -eq 1 ]; then
+ 		cat $tracecodetempfile
+ 	else
+-		cat $tracecodetempfile > $tracecodename
++		cat $tracecodetempfile > $finaltracecodename
++		mv -f $finaltracecodename $tracecodename
+ 	fi
+ fi
+ 
+diff --git a/bsd/kern/subr_log.c b/bsd/kern/subr_log.c
+index 3ff76469965d..1ba73725837e 100644
+--- a/bsd/kern/subr_log.c
++++ b/bsd/kern/subr_log.c
+@@ -79,6 +79,9 @@
+ #include <os/log_private.h>
+ #include <sys/ioctl.h>
+ #include <sys/msgbuf.h>
++#if defined(__arm64__)
++#include <arm64/laguna_panicdump.h>
++#endif
+ #include <sys/file_internal.h>
+ #include <sys/errno.h>
+ #include <sys/select.h>
+@@ -573,6 +576,14 @@ log_putc_locked(struct msgbuf *mbp, char c)
+ 	if (mbp->msg_bufx >= mbp->msg_size) {
+ 		mbp->msg_bufx = 0;
+ 	}
++#if defined(__arm64__)
++	/* R4 (laguna mirror port, 0129): only the kernel msgbuf, never ASL. The
++	 * existing log lock serializes the fixed mirror; no console duplicate is
++	 * introduced. */
++	if (mbp == msgbufp) {
++		laguna_logdump_putc(c, (uint32_t)mbp->msg_bufx);
++	}
++#endif
+ }
+ 
+ /*
 diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
 index 4ca22ee4371a..e95e618b4cb6 100644
 --- a/bsd/kern/sys_generic.c
@@ -1072,6 +1269,36 @@ index 6ae9b6bc3fde..58556c324b67 100644
  	struct vnode_attr attr, va, *vap = &va;
  	int len, nlen, rem, xfer, error, attrerr, gotfh, gotattr;
  	int siz, dircount, maxcount, fullsiz, eofflag, dirlen, nentries, isdotdot;
+diff --git a/bsd/sys/Makefile b/bsd/sys/Makefile
+index 3d349c164e65..16325792d7f4 100644
+--- a/bsd/sys/Makefile
++++ b/bsd/sys/Makefile
+@@ -296,12 +296,24 @@ INSTALL_KF_MI_GEN_LIST =
+ 
+ MAKESYSCALLS = $(SRCROOT)/bsd/kern/makesyscalls.sh
+ 
++# Serialize the generated syscall family under parallel make: the master must
++# be complete before any makesyscalls mode runs, and the modes run one at a
++# time, so a truncated master can never be consumed by a sibling job (see
++# devices/blazer/docs/BUILD.md, "Parallel-build safety").
++.NOTPARALLEL: $(TARGET)/bsd.syscalls.master syscall.h sysproto.h $(OBJROOT)/syscall.codes
++
+ $(OBJROOT)/cscope.genhdrs:
+ 	$(_v)mkdir -p $(OBJROOT)/cscope.genhdrs
+ 
+ $(OBJROOT)/syscall.codes: $(TARGET)/bsd.syscalls.master
+ 	@$(LOG_GENERATE) "$(ColorLF)$@$(Color0) from $(ColorF)$(<F)$(Color0)"
+-	$(_v)$(MAKESYSCALLS) $< trace > $@
++	$(_v)$(MAKESYSCALLS) $< trace > $@.$$$$;	\
++	if [ ! -s $@.$$$$ ]; then			\
++		$(RM) $@.$$$$;				\
++		$(ERR) Truncated generation for $@;	\
++		exit 1;					\
++	fi;						\
++	$(MV) -f $@.$$$$ $@
+ 
+ 
+ $(OBJROOT)/trace.codes: $(SRCROOT)/bsd/kern/trace_codes $(OBJROOT)/syscall.codes
 diff --git a/bsd/sys/disk.h b/bsd/sys/disk.h
 index 82efb4fcc000..47a4cd98e59f 100644
 --- a/bsd/sys/disk.h
@@ -1435,10 +1662,39 @@ index 5b51e9c46a8d..6872b94631c9 100644
  	context.vc_thread = current_thread();
  	context.vc_ucred = cred;
 diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
-index 60c8b9eedd50..b0029de5ef21 100644
+index 60c8b9eedd50..6b6dacfdbe35 100644
 --- a/bsd/vm/vm_unix.c
 +++ b/bsd/vm/vm_unix.c
-@@ -2538,7 +2538,19 @@ after_root_check:
+@@ -102,6 +102,11 @@
+ #include <mach/shared_region.h>
+ #include <vm/vm_shared_region.h>
+ 
++#if defined(__arm64__)
++#include <arm64/laguna_panicdump.h>
++#include <arm64/laguna_lastwords.h>
++#endif
++
+ #include <vm/vm_dyld_pager.h>
+ 
+ #include <vm/vm_protos.h>
+@@ -2074,6 +2079,16 @@ shared_region_check_np(
+ 	kern_return_t           kr;
+ 	task_t                  task = current_task();
+ 
++#if defined(__arm64__)
++	if (proc_getpid(p) == 1) {
++		/* R4 (laguna mirror port, 0129): a PID 1 syscall is the first stamp
++		 * that can only be reached after exec returned toward
++		 * dyld/userland. */
++		(void)laguna_panicdump_stage(LW_STAGE_DYLD_SHARED_REGION,
++		    LW_PRODUCER_XNU_KERNEL, 0, (uint64_t)uap->start_address,
++		    0, 0, 0, "pid1 shared_region_check_np");
++	}
++#endif
+ 	SHARED_REGION_TRACE_DEBUG(
+ 		("shared_region: %p [%d(%s)] -> check_np(0x%llx)\n",
+ 		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+@@ -2538,7 +2553,19 @@ after_root_check:
  #define PREBOOT_CRYPTEX_PATH "/private/preboot/Cryptexes"
  #endif
  			error = vnode_lookup(PREBOOT_CRYPTEX_PATH, 0, &preboot_vp, vfs_context_current());
@@ -1905,6 +2161,40 @@ index 5bd6f23dd10c..252d50062da4 100644
  # Link opensource binary library
  ifneq ($(filter T6000 T8101 VMAPPLE T6000 T8101 VMAPPLE,$(CURRENT_MACHINE_CONFIG)),)
  	LDFLAGS_KERNEL_ONLY += -rdynamic -Wl,-force_load,$(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a
+diff --git a/makedefs/MakeInc.rule b/makedefs/MakeInc.rule
+index 59e4063be9ca..e1a063d3d0de 100644
+--- a/makedefs/MakeInc.rule
++++ b/makedefs/MakeInc.rule
+@@ -435,13 +435,27 @@ P_RULE_4B=
+ #
+ # Explain how to make the bsd syscall list
+ #
++# This master feeds every sysproto/sysent consumer in the tree and is built by
++# more than one make (the bsd/sys header pass and the bsd/conf sysent pass both
++# instantiate this rule). A plain "> $@" truncates the target before unifdef
++# starts writing; under -j, or with a second make sharing the BUILD tree, a
++# reader then observes a 0-byte master, makesyscalls emits a stub sysproto.h,
++# and every syscall consumer fails with "struct xxx_args incomplete" errors.
++# So: generate to a per-pid temp, refuse empty output, then rename atomically.
+ $(TARGET)/bsd.syscalls.master: $(SRCROOT)/bsd/kern/syscalls.master $(MAKESYSCALLS)
+ 	@$(LOG_GENERATE) "$(@F)$(Color0) from $(ColorF)$<$(Color0)"
+-	$(_v)$(UNIFDEF) $(SEED_DEFINES) $< > $@;	\
++	$(_v)$(UNIFDEF) $(SEED_DEFINES) $< > $@.$$$$;	\
+ 	if [ $$? -eq 2 ]; then				\
++		$(RM) $@.$$$$;				\
+ 		$(ERR) Parse failure for $<;		\
+ 		exit 1;					\
+-	fi
++	fi;						\
++	if [ ! -s $@.$$$$ ]; then			\
++		$(RM) $@.$$$$;				\
++		$(ERR) Truncated generation for $@;	\
++		exit 1;					\
++	fi;						\
++	$(MV) -f $@.$$$$ $@
+ 
+ #
+ # This isn't the right place to put this, but we need to := override some settings
 diff --git a/makedefs/MakeInc.top b/makedefs/MakeInc.top
 index 0316792a3f42..b9c195b09cd1 100644
 --- a/makedefs/MakeInc.top
@@ -1919,10 +2209,10 @@ index 0316792a3f42..b9c195b09cd1 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..8edb115c6199 100644
+index e26a1d70f470..924f352cd0e4 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -73,6 +73,11 @@
+@@ -73,6 +73,12 @@
  #include <sys/kdebug.h>
  
  #include <pexpert/pexpert.h>
@@ -1930,11 +2220,12 @@ index e26a1d70f470..8edb115c6199 100644
 +#include <arm64/psci_smp.h>
 +#include <arm64/hakios.blazer_panicdump.h>
 +#include <arm64/hakios.blazer_display.h>
++#include <arm64/laguna_panicdump.h>
 +#endif
  
  #include <console/serial_protos.h>
  
-@@ -335,7 +340,11 @@ arm_setup_pre_sign(void)
+@@ -335,7 +341,11 @@ arm_setup_pre_sign(void)
   */
  
  __startup_func
@@ -1946,7 +2237,7 @@ index e26a1d70f470..8edb115c6199 100644
  arm_init(
  	boot_args       *args)
  {
-@@ -354,6 +363,7 @@ arm_init(
+@@ -354,6 +364,7 @@ arm_init(
  	const_boot_args = *args;
  	BootArgs = args = &const_boot_args;
  
@@ -1954,7 +2245,7 @@ index e26a1d70f470..8edb115c6199 100644
  	cpu_data_init(&BootCpuData);
  #if defined(HAS_APPLE_PAC)
  	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
-@@ -362,14 +372,19 @@ arm_init(
+@@ -362,14 +373,19 @@ arm_init(
  #endif /* defined(HAS_APPLE_PAC) */
  
  	PE_init_platform(FALSE, args); /* Get platform expert set up */
@@ -1974,7 +2265,7 @@ index e26a1d70f470..8edb115c6199 100644
  
  #if (DEVELOPMENT || DEBUG)
  	unsigned long const *platform_stall_ptr = NULL;
-@@ -385,6 +400,7 @@ arm_init(
+@@ -385,6 +401,7 @@ arm_init(
  	}
  
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_ARM_INIT);
@@ -1982,7 +2273,7 @@ index e26a1d70f470..8edb115c6199 100644
  
  	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
  	dt_entry_size = 0;
-@@ -422,10 +438,13 @@ arm_init(
+@@ -422,10 +439,13 @@ arm_init(
  	}
  #endif
  
@@ -1996,7 +2287,7 @@ index e26a1d70f470..8edb115c6199 100644
  	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
  
  	BootCpuData.cpu_number = (unsigned short)master_cpu;
-@@ -439,11 +458,14 @@ arm_init(
+@@ -439,11 +459,14 @@ arm_init(
  	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
  	    + ((uintptr_t)&BootCpuData
  	    - (uintptr_t)(args->virtBase)));
@@ -2011,7 +2302,7 @@ index e26a1d70f470..8edb115c6199 100644
  
  	/*
  	 * Preemption is enabled for this thread so that it can lock mutexes without
-@@ -452,12 +474,16 @@ arm_init(
+@@ -452,12 +475,16 @@ arm_init(
  	 * preemption level is not really meaningful for the bootstrap thread.
  	 */
  	thread->machine.preemption_count = 0;
@@ -2028,7 +2319,7 @@ index e26a1d70f470..8edb115c6199 100644
  
  	/*
  	 * Initialize the timer callout world
-@@ -465,6 +491,7 @@ arm_init(
+@@ -465,6 +492,7 @@ arm_init(
  	timer_call_init();
  
  	cpu_init();
@@ -2036,15 +2327,19 @@ index e26a1d70f470..8edb115c6199 100644
  
  	processor_bootstrap();
  
-@@ -514,6 +541,7 @@ arm_init(
+@@ -514,6 +542,11 @@ arm_init(
  #endif  /* __ARM_PAN_AVAILABLE__ */
  
  	arm_vm_init(xmaxmem, args);
 +	loader_checkpoint(17);
++	/* R4 (laguna mirror port): the early I/O tables now exist, but serial_init
++	 * has not run. Map the shared ramoops aperture once and start the msgbuf
++	 * mirror (laguna_logdump_*; always-on unless lagunalogdump=0). */
++	laguna_logdump_early_init();
  
  	if (debug_boot_arg) {
  		patch_low_glo();
-@@ -527,9 +555,19 @@ arm_init(
+@@ -527,9 +560,25 @@ arm_init(
  
  	/* Setup debugging output. */
  	const unsigned int serial_exists = serial_init();
@@ -2060,11 +2355,17 @@ index e26a1d70f470..8edb115c6199 100644
 +	/* Explicit blazer handoff only: map ramoops and arm the guarded capture.
 +	 * With no boot-arg this is a no-op on every other board. */
 +	hakios_blazer_panicdump_init();
++	/* R4/R5 laguna evidence chain (ported from laguna-panic-capture 0123..0130):
++	 * map the ramoops reserved-mem zone and arm the always-on panic capture +
++	 * msgbuf mirror stages (lagunapanicdump=1 default ON, lagunapanicdump=0
++	 * disables; lagunapanictest=<sec> forces a panic for validation). */
++	laguna_panicdump_init();
++	laguna_logdump_late_init();
 +
  	serialmode = 0;
  	if (PE_parse_boot_argn("serial", &serialmode, sizeof(serialmode))) {
  		/* Do we want a serial keyboard and/or console? */
-@@ -569,6 +607,7 @@ arm_init(
+@@ -569,6 +618,7 @@ arm_init(
  		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
  	}
  	PE_create_console();
@@ -2072,7 +2373,7 @@ index e26a1d70f470..8edb115c6199 100644
  
  	/* setup console output */
  	PE_init_printf(FALSE);
-@@ -647,6 +686,7 @@ arm_init(
+@@ -647,6 +697,7 @@ arm_init(
  	 * against string vulnerabilities
  	 */
  	__stack_chk_guard &= ~(0xFFULL << 8);
@@ -2080,7 +2381,7 @@ index e26a1d70f470..8edb115c6199 100644
  	machine_startup(args);
  }
  
-@@ -673,6 +713,9 @@ arm_init_cpu(
+@@ -673,6 +724,9 @@ arm_init_cpu(
  
  
  	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
@@ -2091,18 +2392,19 @@ index e26a1d70f470..8edb115c6199 100644
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
 diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
-index 39daaf8db949..4829ecd7b1dd 100644
+index 39daaf8db949..12fb487b63ec 100644
 --- a/osfmk/arm/model_dep.c
 +++ b/osfmk/arm/model_dep.c
-@@ -48,6 +48,7 @@
+@@ -48,6 +48,8 @@
  #include <kern/debug.h>
  #include <kern/processor.h>
  #include <kdp/kdp_core.h>
 +#include <arm64/hakios.blazer_panicdump.h>
++#include <arm64/laguna_panicdump.h>
  #if ALTERNATE_DEBUGGER
  #include <arm64/alternate_debugger.h>
  #endif
-@@ -79,6 +80,9 @@
+@@ -79,6 +81,9 @@
  #include <arm/cpu_data_internal.h>
  #include <arm/cpu_internal.h>
  #include <arm/misc_protos.h>
@@ -2112,7 +2414,7 @@ index 39daaf8db949..4829ecd7b1dd 100644
  #include <libkern/OSKextLibPrivate.h>
  #include <vm/vm_kern.h>
  #include <kern/kern_cdata.h>
-@@ -631,6 +635,11 @@ do_print_all_backtraces(const char *message, uint64_t panic_options)
+@@ -631,6 +636,20 @@ do_print_all_backtraces(const char *message, uint64_t panic_options)
  		    "frame pointer outside kernel vm.\n");
  	}
  
@@ -2120,11 +2422,20 @@ index 39daaf8db949..4829ecd7b1dd 100644
 +	 * sections. A later, longer rung supersedes the early string-only record. */
 +	hakios_blazer_panicdump_capture(message, debug_buf_base,
 +	    (vm_size_t)(debug_buf_ptr - debug_buf_base));
++#if defined(__arm64__)
++	/* R4 laguna chain rung 2 (ported, 0123/0124): the panic string AND the
++	 * panicked thread's backtrace frames are in the paniclog region now —
++	 * capture through the always-on Device-memory ramoops mapping (dsb on
++	 * every append, reset-safe immediately). The capture is idempotent per
++	 * boot and size-gated; later rungs supersede this fuller one. */
++	laguna_panicdump_capture(message, debug_buf_base,
++	    (vm_size_t)(debug_buf_ptr - debug_buf_base));
++#endif
 +
  	paniclog_append_noflush("\n");
  	if (filesetKC) {
  		kext_dump_panic_lists(&paniclog_append_noflush);
-@@ -1156,6 +1165,13 @@ wait_while_mp_kdp_trap(bool check_SIGPdebug)
+@@ -1156,6 +1175,13 @@ wait_while_mp_kdp_trap(bool check_SIGPdebug)
  			found_SIGPdebug = true;
  			break;
  		}
@@ -2220,6 +2531,19 @@ index df672c65b144..d7e1da7c5db2 100644
  #endif /* HAS_APPLE_PAC */
  
  	bool reserved11;
+diff --git a/osfmk/arm64/Makefile b/osfmk/arm64/Makefile
+index f819feaf70df..4758f379ddc2 100644
+--- a/osfmk/arm64/Makefile
++++ b/osfmk/arm64/Makefile
+@@ -40,6 +40,8 @@ EXPORT_MD_LIST = \
+ 	monotonic.h \
+ 	perfmon_arm64_regs.h \
+ 	proc_reg.h \
++	laguna_panicdump.h \
++	laguna_lastwords.h \
+ 	asm.h \
+ 	tlb.h \
+ 	pal_hibernate.h
 diff --git a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h b/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
 index b9549da357b4..cca31ea32502 100644
 --- a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
@@ -2252,10 +2576,18 @@ index 94e91306b143..0ec1323086b7 100644
  #endif
  
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index e76e7e70ab9c..828a51171c7e 100644
+index e76e7e70ab9c..a7a9dcd4a3cf 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -734,6 +734,9 @@ ml_get_machine_mem(void)
+@@ -28,6 +28,7 @@
+ 
+ #include <arm64/machine_machdep.h>
+ #include <arm64/proc_reg.h>
++#include <arm64/laguna_panicdump.h>
+ #include <arm/machine_cpu.h>
+ #include <arm/cpu_internal.h>
+ #include <arm/cpuid.h>
+@@ -734,10 +735,18 @@ ml_get_machine_mem(void)
  	return machine_info.memory_size;
  }
  
@@ -2265,7 +2597,16 @@ index e76e7e70ab9c..828a51171c7e 100644
  __attribute__((noreturn))
  void
  halt_all_cpus(boolean_t reboot)
-@@ -745,6 +748,9 @@ halt_all_cpus(boolean_t reboot)
+ {
++#if defined(__arm64__)
++	/* R4 laguna chain (ported, 0129): flush the msgbuf mirror ring before
++	 * the platform reset path runs. */
++	laguna_logdump_flush(LAGUNA_LOGDUMP_FLUSH_HALT);
++#endif
+ 	if (reboot) {
+ 		printf("MACH Reboot\n");
+ 		PEHaltRestart(kPERestartCPU);
+@@ -745,6 +754,9 @@ halt_all_cpus(boolean_t reboot)
  		printf("CPU halted\n");
  		PEHaltRestart(kPEHaltCPU);
  	}
@@ -2275,7 +2616,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  	while (1) {
  		;
  	}
-@@ -932,6 +938,99 @@ ml_read_chip_revision(unsigned int *rev __unused)
+@@ -932,6 +944,99 @@ ml_read_chip_revision(unsigned int *rev __unused)
  #endif
  }
  
@@ -2375,7 +2716,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  void
  ml_parse_cpu_topology(void)
  {
-@@ -945,6 +1044,7 @@ ml_parse_cpu_topology(void)
+@@ -945,6 +1050,7 @@ ml_parse_cpu_topology(void)
  	int64_t cluster_max_cpu_phys_id[MAX_CPU_CLUSTER_PHY_ID + 1];
  	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
  	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
@@ -2383,7 +2724,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  
  	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
  	// so that we trigger a panic later in the boot process, once serial is enabled.
-@@ -1005,6 +1105,20 @@ ml_parse_cpu_topology(void)
+@@ -1005,6 +1111,20 @@ ml_parse_cpu_topology(void)
  		cpu->phys_id = (uint32_t)ml_readprop(child, "reg", ML_READPROP_MANDATORY);
  
  		cpu->l2_access_penalty = (uint32_t)ml_readprop(child, "l2-access-penalty", 0);
@@ -2404,7 +2745,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  		cpu->l2_cache_size = (uint32_t)ml_readprop(child, "l2-cache-size", 0);
  		cpu->l2_cache_id = (uint32_t)ml_readprop(child, "l2-cache-id", 0);
  		cpu->l3_cache_size = (uint32_t)ml_readprop(child, "l3-cache-size", 0);
-@@ -1107,6 +1221,7 @@ ml_parse_cpu_topology(void)
+@@ -1107,6 +1227,7 @@ ml_parse_cpu_topology(void)
  	cluster_offsets[0] = 0;
  #endif
  	assert(topology_info.boot_cpu != NULL);
@@ -2412,7 +2753,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  	ml_read_chip_revision(&topology_info.chip_revision);
  
  	/*
-@@ -1427,17 +1542,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
+@@ -1427,17 +1548,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
  	processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, this_cpu_datap);
  	if (!is_boot_cpu) {
  		processor_init(processor, this_cpu_datap->cpu_number, pset);
@@ -2438,7 +2779,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  
  	*processor_out = processor;
  	*ipi_handler_out = cpu_signal_handler;
-@@ -2237,8 +2350,16 @@ _enable_virtual_timer(void)
+@@ -2237,8 +2356,16 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
@@ -2456,7 +2797,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  
  void
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index e5336e5a1cce..a54e35035cde 100644
+index e5336e5a1cce..e92a2810038b 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -126,6 +126,27 @@ LEXT(LowResetVectorBase)
@@ -2698,7 +3039,7 @@ index e5336e5a1cce..a54e35035cde 100644
  	.align 12, 0
  
  #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
-@@ -452,22 +611,51 @@ start_cpu:
+@@ -452,22 +611,57 @@ start_cpu:
   * Cold boot init routine.  Called from __start
   *   x0 - Boot args
   */
@@ -2735,6 +3076,12 @@ index e5336e5a1cce..a54e35035cde 100644
 -	msr		OSLAR_EL1, xzr
  	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
  
++// LAGUNA R4 (ported, 0129/EL2-ENTRY-DISCIPLINE): ABL hands off with unknown
++// PSTATE.PAN and no VBAR_EL1 yet. Clear PAN before the first MMU-off store,
++// then emit (or suppress via lagunalogdump=0) the physical LGLW XNU_ENTRY
++// record; x0 still holds the boot args PA as the call argument.
++.inst	0xd500409f						// msr PAN, #0
++	bl		EXT(laguna_logdump_entry)
  	mov		x20, x0
  	mov		x21, #0
 +	LOADER_CHECKPOINT 1
@@ -2753,7 +3100,7 @@ index e5336e5a1cce..a54e35035cde 100644
  
  	// Get the kernel memory parameters from the boot args
  	ldr		x22, [x20, BA_VIRT_BASE]			// Get the kernel virt base
-@@ -612,6 +800,7 @@ Lkernelcache_base_found:
+@@ -612,6 +806,7 @@ Lkernelcache_base_found:
  	/* Ensure TTEs are visible */
  	dsb		ish
  
@@ -2761,7 +3108,7 @@ index e5336e5a1cce..a54e35035cde 100644
  
  	b		common_start
  
-@@ -686,7 +875,10 @@ common_start:
+@@ -686,7 +881,10 @@ common_start:
  	dsb		ish
  
  
@@ -2773,7 +3120,7 @@ index e5336e5a1cce..a54e35035cde 100644
  	// Setup timer interrupt routing; must be done before MMU is enabled
  	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
  	and		x15, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
-@@ -740,10 +932,17 @@ common_start:
+@@ -740,10 +938,17 @@ common_start:
  	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
  #endif /* HAS_APPLE_PAC */
  
@@ -2803,21 +3150,23 @@ index 9d98c50094a0..9e3476124e54 100644
 +osfmk/minicrypto/mc_provider.c	standard
 +osfmk/minicrypto/mc_aes.c	standard
 diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
-index c40d57bcc677..f878c23d52c0 100644
+index c40d57bcc677..5a25a68fac68 100644
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
-@@ -25,8 +25,8 @@ osfmk/arm64/WKdmCompress_4k.s	standard
+@@ -25,8 +25,10 @@ osfmk/arm64/WKdmCompress_4k.s	standard
  osfmk/arm64/WKdmData.s		standard
  osfmk/arm64/lz4_decode_arm64.s  standard
  osfmk/arm64/lz4_encode_arm64.s  standard
 -osfmk/arm64/amcc_rorgn_ppl.c optional nos_arm_asm config_pmap_ppl
 -osfmk/arm64/amcc_rorgn_common.c optional nos_arm_asm
++osfmk/arm64/laguna_panicdump.c	standard
++osfmk/arm64/laguna_entry_lastwords.s	standard
 +#osfmk/arm64/amcc_rorgn_ppl.c optional nos_arm_asm config_pmap_ppl
 +#osfmk/arm64/amcc_rorgn_common.c optional nos_arm_asm
  osfmk/arm64/bcopy.s standard
  osfmk/arm64/bzero.s standard
  osfmk/arm/caches.c		standard
-@@ -104,3 +104,11 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
+@@ -104,3 +106,11 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
  osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
  
  osfmk/arm/counter.c	standard
@@ -2848,18 +3197,19 @@ index 384118e8d7a9..2573d2ebd4e6 100644
  				 * io_map doesn't support.  However this buffer is set up
  				 * by the bootloader and doesn't require D$ cleaning, so
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
-index 0a00656a0fdd..e7ed5008b353 100644
+index 0a00656a0fdd..5265b85e5820 100644
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
-@@ -84,6 +84,7 @@
+@@ -84,6 +84,8 @@
  #include <stdatomic.h>
  #include <sys/pgo.h>
  #include <console/serial_protos.h>
 +#include <arm64/hakios.blazer_panicdump.h>
++#include <arm64/laguna_panicdump.h>
  #include <IOKit/IOBSD.h>
  
  #if !(MACH_KDP && CONFIG_KDP_INTERACTIVE_DEBUGGING)
-@@ -1147,9 +1148,12 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+@@ -1147,9 +1149,12 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
  	__builtin_unreachable();
  }
  
@@ -2872,15 +3222,20 @@ index 0a00656a0fdd..e7ed5008b353 100644
  	for (;;) {
  #if defined(__arm__) || defined(__arm64__)
  		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */
-@@ -1163,6 +1167,7 @@ panic_spin_forever(void)
+@@ -1163,6 +1168,12 @@ panic_spin_forever(void)
  static void
  kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags)
  {
 +	loader_return();
++#if defined(__arm64__)
++	/* R4 laguna chain (ported, 0129): PEHaltRestart may reset without
++	 * returning through halt_all_cpus — flush the mirror ring here too. */
++	laguna_logdump_flush(LAGUNA_LOGDUMP_FLUSH_HALT);
++#endif
  	if ((type == kPEPanicRestartCPU) && (debugger_flags & DEBUGGER_OPTION_SKIP_PANICEND_CALLOUTS)) {
  		PEHaltRestart(kPEPanicRestartCPUNoCallouts);
  	} else {
-@@ -1279,6 +1284,10 @@ debugger_collect_diagnostics(unsigned int exception, unsigned int code, unsigned
+@@ -1279,6 +1290,18 @@ debugger_collect_diagnostics(unsigned int exception, unsigned int code, unsigned
  #pragma clang diagnostic pop
  		}
  		paniclog_append_noflush("\n");
@@ -2888,6 +3243,14 @@ index 0a00656a0fdd..e7ed5008b353 100644
 +		 * aborts. The capture's nofault guards keep this path bounded. */
 +		hakios_blazer_panicdump_capture(debugger_panic_str, debug_buf_base,
 +		    (vm_size_t)(debug_buf_ptr - debug_buf_base));
++#if defined(__arm64__)
++		/* R4 laguna chain rung 1 (ported, 0123): the panic string is in the
++		 * paniclog region now. laguna_panicdump_capture is idempotent per
++		 * boot — a fuller rung re-captures over this one (size-gated); this
++		 * rung only stands if that rung never runs. */
++		laguna_panicdump_capture(debugger_panic_str, debug_buf_base,
++		    (vm_size_t)(debug_buf_ptr - debug_buf_base));
++#endif
  	}
  #if defined(__x86_64__)
  	else if (((debugger_current_op == DBOP_DEBUGGER) && debugger_is_panic)) {
@@ -3212,7 +3575,7 @@ index 3ad743fc3efb..ce036c5a2c26 100644
  void
  pe_init_fiq()
 diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
-index c622b4cc84ab..6b6ec2dcc045 100644
+index c622b4cc84ab..d547fe9d3d17 100644
 --- a/pexpert/arm/pe_init.c
 +++ b/pexpert/arm/pe_init.c
 @@ -79,6 +79,10 @@ struct macos_panic_header *mac_panic_header = NULL;
@@ -3226,7 +3589,7 @@ index c622b4cc84ab..6b6ec2dcc045 100644
  /* Whether a console is standing by for panic logging */
  static boolean_t panic_console_available = FALSE;
  
-@@ -93,6 +97,19 @@ void PE_slide_devicetree(vm_offset_t);
+@@ -93,6 +97,40 @@ void PE_slide_devicetree(vm_offset_t);
  static void
  check_for_panic_log(void)
  {
@@ -3237,6 +3600,27 @@ index c622b4cc84ab..6b6ec2dcc045 100644
 +		DTEntry pram_entry;
 +
 +		if (kSuccess != SecureDTLookupEntry(0, "pram", &pram_entry)) {
++			gPanicBase = (vm_offset_t)blazer_panic_region;
++			gPanicSize = sizeof(blazer_panic_region);
++			panic_text_len = gPanicSize - sizeof(struct embedded_panic_header);
++			return;
++		}
++	}
++	{
++		/* R4 laguna chain (ported, 0123): lagunapanicdump defaults ON, and
++		 * the phone/kexec ADT has no iBoot pram node — without a region the
++		 * panic path wedges in SavePanicInfo before any paniclog text
++		 * exists (=0 disables; a real pram node always wins below). The
++		 * region is shared with the blazer fallback above (same 512 KiB
++		 * .bss, same purpose; the two capture paths are never armed
++		 * together). */
++		uint32_t laguna_fallback = 1;
++		DTEntry pram_entry;
++
++		(void)PE_parse_boot_argn("lagunapanicdump", &laguna_fallback,
++		    sizeof(laguna_fallback));
++		if (laguna_fallback != 0 &&
++		    kSuccess != SecureDTLookupEntry(0, "pram", &pram_entry)) {
 +			gPanicBase = (vm_offset_t)blazer_panic_region;
 +			gPanicSize = sizeof(blazer_panic_region);
 +			panic_text_len = gPanicSize - sizeof(struct embedded_panic_header);

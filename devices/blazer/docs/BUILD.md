@@ -32,14 +32,21 @@ return an error after the Mach-O has linked. Check the artifact and the actual
 compile log rather than treating that known post-link status as proof of
 success or failure.
 
-**Use `-j8`, not higher.** A `-j15` build hit a real race: the generated
-syscall family truncated (`bsd.syscalls.master` came out 0 bytes → 44-line
-`sysproto.h` → 1355 `init_sysent.c` errors). The remedy that worked: delete
-the generated family (`bsd.syscalls.master`, `sysproto.h`, `syscall.h`,
-`init_sysent.c`, `syscalls.c`, `audit_kevents.c`, `systrace_args.c` in both
-`obj` and `EXPORT_HDRS`) and rebuild `-j8` — the kernel then links with zero
-compile errors. If a build fails with `struct ..._args incomplete` in
-`init_sysent.c`, suspect truncated generated files before anything else.
+## Parallel-build safety
+
+The generated syscall family is guarded so `-j` builds are deterministic:
+`bsd/kern/syscalls.master` is filtered into a per-pid temp and renamed into
+place (`makedefs/MakeInc.rule`), `makesyscalls.sh` stages every output file
+(`syscall.h`, `sysproto.h`, `init_sysent.c`, `syscalls.c`, `audit_kevents.c`,
+`systrace_args.c`) the same way, and the generation rules are serialized with
+`.NOTPARALLEL` (`bsd/sys/Makefile`, `bsd/conf/Makefile.template`) so sibling
+jobs cannot read a file mid-write or interleave two modes of the script.
+Without this, a 0-byte or partial `bsd.syscalls.master` (or a torn derived
+header) reaches parallel consumers and the build dies with ~1355
+"struct xxx_args incomplete" errors. Generation is serialized only: object
+compiles keep their full parallelism. See
+`research/laguna-foundation/BUILD-RACE-GUARD.md` for the failure analysis and
+the reproduction harness.
 
 For development after editing `xnu-src/xnu-8796.121.2`, regenerate the clean
 patch + overlay **before committing**:

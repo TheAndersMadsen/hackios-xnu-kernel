@@ -47,7 +47,28 @@ enum laguna_display_flags {
 
 #define LAGUNA_DISPLAY_REQUIRED_FLAGS LAGUNA_DISPLAY_KNOWN_FLAGS
 
+/*
+ * Cold-handoff flag policy (DISPLAY-PRODUCER §3.2, fail-closed): a producer
+ * that has not proven DPU power, configuration, IOMMU mapping and live scanout
+ * must assert exactly the CPU-side facts — CPU_PA_VALID, LINEAR_32BPP,
+ * PHYS_CONTIGUOUS, RESERVED — and nothing more.  Any ownership/liveness bit
+ * (LAGUNA_DISPLAY_LIVE_FLAGS) in a record switches it onto the full
+ * REQUIRED_FLAGS contract instead; a record carrying some but not all of them
+ * is refused outright (a partial ownership claim is never adopted).  A cold
+ * record must also leave DPU_IOVA_VALID unset: with dpu_iova=0 and
+ * mapping_kind NONE there is no DPU mapping to be valid.
+ */
+#define LAGUNA_DISPLAY_COLD_REQUIRED ( \
+	LAGUNA_DISPLAY_CPU_PA_VALID | LAGUNA_DISPLAY_LINEAR_32BPP | \
+	LAGUNA_DISPLAY_PHYS_CONTIGUOUS | LAGUNA_DISPLAY_RESERVED)
+#define LAGUNA_DISPLAY_LIVE_FLAGS ( \
+	LAGUNA_DISPLAY_DPU_CONFIGURED | LAGUNA_DISPLAY_POWER_RETAINED | \
+	LAGUNA_DISPLAY_IOMMU_RETAINED | LAGUNA_DISPLAY_SCANOUT_LIVE)
+#define LAGUNA_DISPLAY_COLD_FORBIDDEN ( \
+	LAGUNA_DISPLAY_DPU_IOVA_VALID | LAGUNA_DISPLAY_LIVE_FLAGS)
+
 enum laguna_display_mapping {
+	LAGUNA_DISPLAY_MAPPING_NONE = 0, /* no DPU mapping claimed (cold handoff) */
 	LAGUNA_DISPLAY_MAPPING_IDENTITY = 1,
 	LAGUNA_DISPLAY_MAPPING_FIRST_STAGE_SMMU = 2
 };
@@ -128,6 +149,20 @@ void laguna_display_handoff_seal(struct laguna_display_handoff *handoff);
 
 /* Validate all fields and ensure the reserved framebuffer avoids forbidden RAM. */
 enum laguna_display_error laguna_display_validate(
+	const struct laguna_display_handoff *handoff,
+	const struct laguna_memory_range *forbidden,
+	size_t forbidden_count);
+
+/*
+ * Validate a cold (RAM-console) handoff: identical integrity, geometry,
+ * reservation and forbidden-range rules, but the flag policy is
+ * LAGUNA_DISPLAY_COLD_REQUIRED only and no DPU mapping may be claimed
+ * (dpu_iova == 0, mapping_kind == NONE).  Acceptance proves the buffer is a
+ * reserved CPU-side RAM console — it is never a scanout claim.  The checks are
+ * kept textually parallel to laguna_display_validate so the golden
+ * single-bit-corruption error-code mapping stays stable for both tiers.
+ */
+enum laguna_display_error laguna_display_validate_cold(
 	const struct laguna_display_handoff *handoff,
 	const struct laguna_memory_range *forbidden,
 	size_t forbidden_count);

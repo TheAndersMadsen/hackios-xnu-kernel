@@ -121,6 +121,13 @@ public:
 
 OSDefineMetaClassAndStructors(AppleKeyStore, IOService);
 
+#if defined(__arm64__)
+/* R4 laguna chain (ported, 0123): declared at file scope — linkage
+ * specifications are not allowed at block scope, and iokit C++ compiles do
+ * not carry the osfmk include paths. */
+extern "C" void laguna_panicdump_bootdone(void);
+#endif
+
 bool
 AppleKeyStore::start(IOService * provider)
 {
@@ -130,6 +137,13 @@ AppleKeyStore::start(IOService * provider)
 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
 	setName("AppleKeyStore");
 	registerService();
+#if defined(__arm64__)
+	/* R4 laguna chain arming site (ported, 0123 — the 141 tree used
+	 * LagunaKeyStore::start): the first laguna-platform IOKit driver start is
+	 * the earliest fully-threaded hook on every delivery path (kernel threads
+	 * are runnable in IOService::start, unlike arm_init). */
+	laguna_panicdump_bootdone();
+#endif
 	return true;
 }
 

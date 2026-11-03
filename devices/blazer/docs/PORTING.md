@@ -40,10 +40,13 @@ not imply an on-device validation claim — QEMU results are labeled QEMU.
       `docs/RENDER.md` §2–§6. What remains is the device-gated integration:
       a display-owning Linux first stage (cold Google UFS/PHY/CPM and DPU
       production live there by design) that emits a valid record.
-- [x] The XNU-side display handoff is implemented: the 128-byte CRC'd record is
-      validated before video changes; invalid records go headless, GOP/ramfb is
-      preserved when no record exists, and CLEAN_ON_PRESENT/WC have distinct
-      presenter cache paths. See `docs/BOOT-CONTRACT.md` for the forbidden ranges.
+- [x] The XNU-side display handoff is implemented with fail-closed tiers:
+      complete nine-flag ownership claims adopt scanout; clean four-flag cold
+      records become `RAMCONSOLE display-unowned`; partial/unknown claims go
+      headless. No record preserves GOP/ramfb as `UNOWNED`, and
+      `io.display.native=1` is explicitly `NATIVE-REFUSED` (there is no native
+      DPU owner). CLEAN_ON_PRESENT/WC have distinct presenter cache paths. See
+      `docs/BOOT-CONTRACT.md` for the forbidden ranges.
 - [x] `MiniIOMFB` display-config selectors answered: 57 (color remap),
       27/17 (the 3084-byte get/set twin over a shadow block), 84/50/68 accept.
       This is what lets backboardd probe without a FrontBoardServices assert.
@@ -95,10 +98,12 @@ not imply an on-device validation claim — QEMU results are labeled QEMU.
 
 ## 4. Touch, storage, other drivers
 
-- [ ] TCM touch: AOC pad-slot layout, TBN bus-parked check, CPM hard
-      reset/rails, TCM generation detect, SSI clock liveness. The host-tested
-      driver exists (198/198); the on-device bring-up is deferred to a later
-      rotation.
+- [x] TCM touch is source-integrated as `bsd/dev/hakios.tcm.{c,h}` behind
+      `blazer_touch=1` (default 0, nothing maps): protocol v1/v2, DW-SSI, AOC
+      attention polling, late-start recovery and the `/dev/hakios-touch` ABI.
+      The integrated source passes 198/198 normally and under ASan/UBSan.
+      AOC pad-slot layout, TBN bus-parked state and CPM hard reset/rails remain
+      explicitly NEEDS-DEVICE-PROBE, so no on-device touch claim is made.
 - [ ] Cold UFS production: the in-kernel side is source-integrated and
       fail-closed — `xnu/files/bsd/dev/hakios.blazer_ufs.c` is a read-only
       DWC UFS takeover requiring `blazer_ufs_live=1` plus an explicit
@@ -117,6 +122,11 @@ not imply an on-device validation claim — QEMU results are labeled QEMU.
       `blazer_panicdump=1`, early+full nofault-guarded capture rungs, persistent_ram
       console append plus the CRC'd pmsg mirror. The missing-`pram` case uses a
       static 512 KiB fallback only when explicitly enabled; a real `pram` wins.
+- [x] The R4/R5 evidence chain is also integrated: `laguna_panicdump`,
+      `laguna_logdump`, LGLW entry records and halt/reboot flushes. Their defaults
+      are `lagunapanicdump=1` and `lagunalogdump=1` (`=0` disables). Keep the
+      separate `blazer_panicdump` opt-in off on the phone so there is exactly one
+      capture writer; `lagunapanictest=<sec>` is validation-only.
 
 ## 5. Delivery and evidence
 

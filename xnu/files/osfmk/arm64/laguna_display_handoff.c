@@ -182,6 +182,104 @@ laguna_display_validate(const struct laguna_display_handoff *handoff,
 	return validate_forbidden(handoff, forbidden, forbidden_count);
 }
 
+/*
+ * Cold-handoff validator (DISPLAY-PRODUCER §3.2).  Same integrity, geometry,
+ * reservation, cache, producer, generation and forbidden-range rules as
+ * laguna_display_validate(); different flag and mapping policy:
+ *   - flags must carry COLD_REQUIRED and no COLD_FORBIDDEN bit;
+ *   - refresh_millihz may be the honest zero (no measured refresh on the cold
+ *     path — vsync there is a software beat, USERLAND-PATH M7);
+ *   - dpu_iova must be 0 and mapping_kind must be NONE.
+ * Acceptance never implies scanout: it proves a reserved linear RAM buffer.
+ */
+enum laguna_display_error
+laguna_display_validate_cold(const struct laguna_display_handoff *handoff,
+	const struct laguna_memory_range *forbidden, size_t forbidden_count)
+{
+	uint64_t needed, end;
+
+	if (handoff == NULL || (forbidden_count != 0 && forbidden == NULL)) {
+		return LAGUNA_DISPLAY_BAD_ARGUMENT;
+	}
+	if ((handoff->flags & LAGUNA_DISPLAY_COLD_REQUIRED) != LAGUNA_DISPLAY_COLD_REQUIRED) {
+		return LAGUNA_DISPLAY_MISSING_FLAGS;
+	}
+	/* Any ownership/liveness/IOVA bit turns this into a full-contract record;
+	 * it must then satisfy laguna_display_validate() or be refused. */
+	if ((handoff->flags & LAGUNA_DISPLAY_COLD_FORBIDDEN) != 0) {
+		return LAGUNA_DISPLAY_UNKNOWN_FLAGS;
+	}
+	if (handoff->magic != LAGUNA_DISPLAY_HANDOFF_MAGIC) {
+		return LAGUNA_DISPLAY_BAD_MAGIC;
+	}
+	if (handoff->version != LAGUNA_DISPLAY_HANDOFF_VERSION) {
+		return LAGUNA_DISPLAY_BAD_VERSION;
+	}
+	if (handoff->struct_size != LAGUNA_DISPLAY_HANDOFF_SIZE) {
+		return LAGUNA_DISPLAY_BAD_STRUCT_SIZE;
+	}
+	if (handoff->reserved[0] != 0 || handoff->reserved[1] != 0 || handoff->reserved[2] != 0) {
+		return LAGUNA_DISPLAY_BAD_RESERVED;
+	}
+	if (handoff->crc32 != handoff_crc(handoff)) {
+		return LAGUNA_DISPLAY_BAD_CRC;
+	}
+	if ((handoff->flags & ~LAGUNA_DISPLAY_KNOWN_FLAGS) != 0) {
+		return LAGUNA_DISPLAY_UNKNOWN_FLAGS;
+	}
+	if (handoff->pixel_format != LAGUNA_PIXEL_ARGB8888 &&
+	    handoff->pixel_format != LAGUNA_PIXEL_XRGB8888) {
+		return LAGUNA_DISPLAY_BAD_FORMAT;
+	}
+	/* Honest zero allowed here in addition to the measured-range values the
+	 * full contract requires; the cold consumer treats both as "no panel
+	 * claim" — vsync is a software beat until live scanout exists. */
+	if (handoff->width == 0 || handoff->height == 0 ||
+	    handoff->width > 8192 || handoff->height > 8192 ||
+	    (handoff->refresh_millihz != 0 &&
+	    (handoff->refresh_millihz < 1000 || handoff->refresh_millihz > 240000))) {
+		return LAGUNA_DISPLAY_BAD_GEOMETRY;
+	}
+	if ((uint64_t)handoff->stride < (uint64_t)handoff->width * 4 ||
+	    (handoff->stride & 0xffu) != 0) {
+		return LAGUNA_DISPLAY_BAD_STRIDE;
+	}
+	needed = (uint64_t)handoff->stride * handoff->height;
+	if (handoff->cpu_size < needed || (handoff->cpu_size & 0xfffu) != 0) {
+		return LAGUNA_DISPLAY_BAD_CPU_SIZE;
+	}
+	if (handoff->cpu_pa < UINT64_C(0x80000000) ||
+	    handoff->cpu_pa >= (UINT64_C(1) << 40) || (handoff->cpu_pa & 0xffu) != 0 ||
+	    handoff->cpu_pa + handoff->cpu_size < handoff->cpu_pa) {
+		return LAGUNA_DISPLAY_BAD_CPU_PA;
+	}
+	end = handoff->cpu_pa + handoff->cpu_size;
+	if (end > (UINT64_C(1) << 40)) {
+		return LAGUNA_DISPLAY_BAD_CPU_PA;
+	}
+	if (handoff->dpu_iova != 0) {
+		return LAGUNA_DISPLAY_BAD_IOVA;
+	}
+	if (handoff->reserve_pa != handoff->cpu_pa || handoff->reserve_size != handoff->cpu_size) {
+		return LAGUNA_DISPLAY_BAD_RESERVATION;
+	}
+	if (handoff->mapping_kind != LAGUNA_DISPLAY_MAPPING_NONE) {
+		return LAGUNA_DISPLAY_BAD_MAPPING;
+	}
+	if (handoff->cache_kind != LAGUNA_DISPLAY_CACHE_WRITE_COMBINE &&
+	    handoff->cache_kind != LAGUNA_DISPLAY_CACHE_CLEAN_ON_PRESENT) {
+		return LAGUNA_DISPLAY_BAD_CACHE;
+	}
+	if (handoff->producer[0] < 33 || handoff->producer[0] > 126 ||
+	    !producer_has_nul(handoff->producer, sizeof(handoff->producer))) {
+		return LAGUNA_DISPLAY_BAD_PRODUCER;
+	}
+	if (handoff->commit_generation == 0) {
+		return LAGUNA_DISPLAY_BAD_GENERATION;
+	}
+	return validate_forbidden(handoff, forbidden, forbidden_count);
+}
+
 enum laguna_display_error
 laguna_display_boot_video(const struct laguna_display_handoff *handoff,
 	const struct laguna_memory_range *forbidden, size_t forbidden_count,

@@ -89,6 +89,14 @@ The loader/first stage creates a flattened Apple device tree. At minimum:
   stays headless; an absent record preserves loader GOP/ramfb video.
   `cache_kind=CLEAN_ON_PRESENT` cleans the completed MiniIOMFB frame to PoC;
   write-combine takes the presenter barrier path.
+
+  Decision tiers are fail-closed: all nine ownership flags use the full M5
+  validator and adopt scanout; exactly the four cold CPU-side flags use
+  `laguna_display_validate_cold()` and become `RAMCONSOLE display-unowned`;
+  partial or unknown claims clear video; no record leaves GOP/ramfb `UNOWNED`;
+  and `io.display.native=1` is `NATIVE-REFUSED` until a real DPU owner exists.
+  The cold record's `dpu_iova` is zero and `mapping_kind=NONE`, so it is a RAM
+  console, never a scanout claim. No tier accesses DC9x00/DSI/CDPHY MMIO.
 - `/pram` when a real persistent panic region exists. If it is absent and
   `blazer_panicdump=1`, the kernel uses its static 512 KiB fallback; a real
   `pram` always wins.
@@ -152,6 +160,10 @@ Optional pieces are enabled individually:
 | `blazer_cpm_global=`, `blazer_cpm_req=`, `blazer_cpm_resp=` | DT-derived CPM addresses; defaults `0x05250000`, `0x05260000`, `0x05261000` |
 | `blazer_panicdump=1` | Map ramoops and arm guarded console+panic-mirror capture; default 0 |
 | `blazer_panictest=N` | Optional forced panic after N seconds; default 0, test only |
+| `blazer_touch=1` | Enable the integrated TCM touch driver; default 0, maps nothing. AOC/TBN/CPM reset remain device-probe items |
+| `lagunapanicdump=1` | R4/R5 panic capture default ON; `=0` disables. Keep the separate `blazer_panicdump` off on the phone so only one writer is active |
+| `lagunalogdump=1` | R4/R5 msgbuf mirror default ON; `=0` disables |
+| `lagunapanictest=N` | R4/R5 validation-only forced panic after N seconds; default 0 |
 | `blazer_ramoops_base=`, `blazer_ramoops_size=` | DT ramoops geometry |
 | `blazer_console_size=`, `blazer_pmsg_base=`, `blazer_pmsg_size=` | Console/pmsg geometry, validated before mapping |
 | `fb_compatible=google,lga-framebuffer` | MiniIOMFB display nub compatible; no hardware access |
@@ -171,7 +183,17 @@ first-stage transport knobs. Do not put those in `devices/blazer/soc.args` and
 do not confuse them with PE arguments. `blazer_ufs_live=1` is set only after the
 first stage has actually completed the live handoff.
 
-## 5. Kernel-live and return ABI
+## 5. R4/R5 evidence chain
+
+The integrated `laguna_panicdump`/`laguna_logdump` modules preserve the final
+0123–0130 mechanisms beside the separate opt-in `blazer_panicdump` module. They
+write early entry evidence, msgbuf mirror updates and halt/reboot flushes. The
+v2 placements are `XNU-MSGBUF` header `0x95440000`, LGLW `0x95401100/0x95401180`,
+compact trail `0x95428000`, and pmsg scratch `0x95401000`; the existing marker,
+MARKER-SCRATCH and pmsg+`0x30000` mirror contracts are unchanged. Do not enable
+both capture writers on the phone.
+
+## 6. Kernel-live and return ABI
 
 M2 leaves the new foundation's ABI unchanged:
 
